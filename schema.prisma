@@ -1,0 +1,165 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum League {
+  MENS
+  WOMENS
+}
+
+enum GameStatus {
+  SCHEDULED
+  IN_PROGRESS
+  FINAL
+  POSTPONED
+  CANCELLED
+}
+
+model Team {
+  id              String   @id @default(cuid())
+  league          League
+  season          String   // e.g., "2025-26"
+  name            String
+  providerTeamId  String   @map("provider_team_id")
+  conference      String?
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  homeGames       Game[]   @relation("HomeTeam")
+  awayGames       Game[]   @relation("AwayTeam")
+  teamGameStats   TeamGameStats[]
+  opponentStats   TeamGameStats[] @relation("OpponentStats")
+  seasonRollup    TeamSeasonRollup?
+
+  @@unique([league, season, providerTeamId])
+  @@index([league, season])
+  @@map("teams")
+}
+
+model Game {
+  id              String     @id @default(cuid())
+  league          League
+  season          String
+  providerGameId  String     @map("provider_game_id")
+  dateTime        DateTime   @map("date_time")
+  homeTeamId      String     @map("home_team_id")
+  awayTeamId      String     @map("away_team_id")
+  neutralSite     Boolean    @default(false) @map("neutral_site")
+  status          GameStatus @default(SCHEDULED)
+  homeScore       Int?       @map("home_score")
+  awayScore       Int?       @map("away_score")
+  statsProcessed  Boolean    @default(false) @map("stats_processed")
+  lastSyncedAt    DateTime   @default(now()) @map("last_synced_at")
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  homeTeam        Team       @relation("HomeTeam", fields: [homeTeamId], references: [id])
+  awayTeam        Team       @relation("AwayTeam", fields: [awayTeamId], references: [id])
+  teamGameStats   TeamGameStats[]
+
+  @@unique([league, season, providerGameId])
+  @@index([league, season, dateTime])
+  @@index([status, statsProcessed])
+  @@map("games")
+}
+
+model TeamGameStats {
+  id              String   @id @default(cuid())
+  gameId          String   @map("game_id")
+  teamId          String   @map("team_id")
+  opponentId      String   @map("opponent_id")
+  league          League
+  season          String
+
+  // Offensive stats (what this team scored)
+  off2ptm         Int      @map("off_2ptm")
+  off2pta         Int      @map("off_2pta")
+  off3ptm         Int      @map("off_3ptm")
+  off3pta         Int      @map("off_3pta")
+  offFtm          Int      @map("off_ftm")
+  offFta          Int      @map("off_fta")
+
+  // Defensive stats (what this team allowed)
+  def2ptmAllowed  Int      @map("def_2ptm_allowed")
+  def2ptaAllowed  Int      @map("def_2pta_allowed")
+  def3ptmAllowed  Int      @map("def_3ptm_allowed")
+  def3ptaAllowed  Int      @map("def_3pta_allowed")
+  defFtmAllowed   Int      @map("def_ftm_allowed")
+  defFtaAllowed   Int      @map("def_fta_allowed")
+
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  game            Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  team            Team     @relation(fields: [teamId], references: [id])
+  opponent        Team     @relation("OpponentStats", fields: [opponentId], references: [id])
+
+  @@unique([gameId, teamId])
+  @@index([league, season, teamId])
+  @@map("team_game_stats")
+}
+
+model TeamSeasonRollup {
+  id              String   @id @default(cuid())
+  teamId          String   @unique @map("team_id")
+  league          League
+  season          String
+  gamesPlayed     Int      @default(0) @map("games_played")
+
+  // Offensive totals
+  off2ptmTotal    Int      @default(0) @map("off_2ptm_total")
+  off2ptaTotal    Int      @default(0) @map("off_2pta_total")
+  off3ptmTotal    Int      @default(0) @map("off_3ptm_total")
+  off3ptaTotal    Int      @default(0) @map("off_3pta_total")
+  offFtmTotal     Int      @default(0) @map("off_ftm_total")
+  offFtaTotal     Int      @default(0) @map("off_fta_total")
+
+  // Defensive totals (allowed)
+  def2ptmAllowedTotal  Int @default(0) @map("def_2ptm_allowed_total")
+  def2ptaAllowedTotal  Int @default(0) @map("def_2pta_allowed_total")
+  def3ptmAllowedTotal  Int @default(0) @map("def_3ptm_allowed_total")
+  def3ptaAllowedTotal  Int @default(0) @map("def_3pta_allowed_total")
+  defFtmAllowedTotal   Int @default(0) @map("def_ftm_allowed_total")
+  defFtaAllowedTotal   Int @default(0) @map("def_fta_allowed_total")
+
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  team            Team     @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([league, season])
+  @@map("team_season_rollup")
+}
+
+model NationalAverages {
+  id              String   @id @default(cuid())
+  league          League
+  season          String
+
+  // Per-game averages across all teams
+  natOff2ptmPg    Float    @map("nat_off_2ptm_pg")
+  natOff2ptaPg    Float    @map("nat_off_2pta_pg")
+  natOff3ptmPg    Float    @map("nat_off_3ptm_pg")
+  natOff3ptaPg    Float    @map("nat_off_3pta_pg")
+  natOffFtmPg     Float    @map("nat_off_ftm_pg")
+  natOffFtaPg     Float    @map("nat_off_fta_pg")
+
+  // Defensive averages (what teams allow on average)
+  natDef2ptmAllowedPg  Float @map("nat_def_2ptm_allowed_pg")
+  natDef2ptaAllowedPg  Float @map("nat_def_2pta_allowed_pg")
+  natDef3ptmAllowedPg  Float @map("nat_def_3ptm_allowed_pg")
+  natDef3ptaAllowedPg  Float @map("nat_def_3pta_allowed_pg")
+  natDefFtmAllowedPg   Float @map("nat_def_ftm_allowed_pg")
+  natDefFtaAllowedPg   Float @map("nat_def_fta_allowed_pg")
+
+  // National average points per team per game
+  natPointsPgPerTeam   Float @map("nat_points_pg_per_team")
+
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@unique([league, season])
+  @@map("national_averages")
+}

@@ -205,7 +205,7 @@ async function upsertTeam(
   season: string,
   providerTeamId: string,
   name: string,
-  shortName?: string
+shortName: shortName ?? null,
 ): Promise<{ team: { id: string }; inserted: boolean }> {
   // Check if team exists
   const existing = await prisma.team.findUnique({

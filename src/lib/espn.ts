@@ -7,7 +7,7 @@ const ESPN_WBB_GAME_URL = 'https://site.api.espn.com/apis/site/v2/sports/basketb
 
 const FETCH_TIMEOUT_MS = 10000; // 10 seconds
 const MAX_RETRIES = 3;
-const RATE_LIMIT_MS = 350; // 300-500ms between calls
+await sleep(RATE_LIMIT_MS);
 
 // Exported types for ESPN data
 export interface ESPNTeamData {

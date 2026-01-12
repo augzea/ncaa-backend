@@ -33,6 +33,9 @@ await fastify.register(teamsRoutes);
 fastify.get('/health', async () => {
   return { ok: true, season: getCurrentSeason() };
 });
+fastify.get('/api/version', async () => {
+  return { ok: true, deployedAt: new Date().toISOString() };
+});
 
 // ============ Admin Endpoints ============
 

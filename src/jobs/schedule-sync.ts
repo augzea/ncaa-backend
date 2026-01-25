@@ -47,12 +47,9 @@ function deriveSeasonFromDate(dateStr: string): string {
   const month = date.getUTCMonth() + 1;
 
   if (month >= 10) {
-    // Oct-Dec: season is current year to next year
     return `${year}-${String(year + 1).slice(2)}`;
-  } else {
-    // Jan-Sep: season is previous year to current year
-    return `${year - 1}-${String(year).slice(2)}`;
   }
+  return `${year - 1}-${String(year).slice(2)}`;
 }
 
 /**
@@ -67,19 +64,16 @@ export function getCurrentSeason(): string {
     return `${year}-${String(year + 1).slice(2)}`;
   } else if (month <= 4) {
     return `${year - 1}-${String(year).slice(2)}`;
-  } else {
-    // Off-season: default to upcoming season
-    return `${year}-${String(year + 1).slice(2)}`;
   }
+  // Off-season: default to upcoming season
+  return `${year}-${String(year + 1).slice(2)}`;
 }
 
 /**
  * Map ESPN game status to our status enum
  */
 function mapGameStatus(event: ESPNEventData): GameStatus {
-  if (event.completed) {
-    return 'FINAL';
-  }
+  if (event.completed) return 'FINAL';
 
   switch (event.statusState) {
     case 'post':
@@ -88,12 +82,12 @@ function mapGameStatus(event: ESPNEventData): GameStatus {
       return 'IN_PROGRESS';
     case 'pre':
       return 'SCHEDULED';
-    default:
-      // Check status name for postponed/cancelled
-      const statusName = event.statusName.toUpperCase();
+    default: {
+      const statusName = (event.statusName || '').toUpperCase();
       if (statusName.includes('POSTPONED')) return 'POSTPONED';
       if (statusName.includes('CANCEL')) return 'CANCELLED';
       return 'SCHEDULED';
+    }
   }
 }
 
@@ -146,8 +140,7 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
               league as PrismaLeague,
               season,
               event.home.id,
-              event.home.displayName,
-              event.home.abbreviation
+              event.home.displayName
             );
             result[resultKey].teamsInserted += homeTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += homeTeamResult.inserted ? 0 : 1;
@@ -157,8 +150,7 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
               league as PrismaLeague,
               season,
               event.away.id,
-              event.away.displayName,
-              event.away.abbreviation
+              event.away.displayName
             );
             result[resultKey].teamsInserted += awayTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += awayTeamResult.inserted ? 0 : 1;
@@ -181,7 +173,7 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
         }
 
         // Small delay between date requests
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 100));
       } catch (dateError) {
         const errMsg = `${league} ${dateStr}: ${String(dateError)}`;
         result[resultKey].errors.push(errMsg);
@@ -190,24 +182,33 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
       }
     }
 
-    console.log(`[Schedule Sync] ${league} complete: ${result[resultKey].gamesInserted} inserted, ${result[resultKey].gamesUpdated} updated`);
+    console.log(
+      `[Schedule Sync] ${league} complete: ${result[resultKey].gamesInserted} inserted, ${result[resultKey].gamesUpdated} updated`
+    );
   }
 
-  console.log(`[Schedule Sync] Complete. Total games: ${result.mens.gamesInserted + result.mens.gamesUpdated + result.womens.gamesInserted + result.womens.gamesUpdated}`);
+  console.log(
+    `[Schedule Sync] Complete. Total games: ${
+      result.mens.gamesInserted +
+      result.mens.gamesUpdated +
+      result.womens.gamesInserted +
+      result.womens.gamesUpdated
+    }`
+  );
+
   return result;
 }
 
 /**
  * Upsert a team and ensure it has a season rollup record
+ * NOTE: Your Prisma schema has TeamSeasonRollup.teamId as @unique, so we upsert by teamId.
  */
 async function upsertTeam(
   league: PrismaLeague,
   season: string,
   providerTeamId: string,
-  name: string,
-  shortName?: string
+  name: string
 ): Promise<{ team: { id: string }; inserted: boolean }> {
-  // Check if team exists
   const existing = await prisma.team.findUnique({
     where: {
       league_season_providerTeamId: {
@@ -231,29 +232,24 @@ async function upsertTeam(
       season,
       providerTeamId,
       name,
-      shortName: shortName ?? null,
     },
     update: {
       name,
-      shortName: shortName ?? null,
     },
   });
 
-  // Ensure season rollup exists (unique should be teamId+league+season in your schema)
+  // Ensure rollup exists (schema: teamId is unique)
   await prisma.teamSeasonRollup.upsert({
-    where: {
-      teamId_league_season: {
-        teamId: team.id,
-        league,
-        season,
-      },
-    },
+    where: { teamId: team.id },
     create: {
       teamId: team.id,
       league,
       season,
     },
-    update: {},
+    update: {
+      league,
+      season,
+    },
   });
 
   return { team, inserted: !existing };

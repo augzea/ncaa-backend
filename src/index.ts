@@ -12,6 +12,12 @@ import { buildNationalAverages } from './jobs/national-averages.js';
 
 import { runStartupBootstrap, getBootstrapStatus } from './bootstrap.js';
 
+console.log('*** NEW BUILD ACTIVE: GET admin routes + ESPN ***');
+
+fastify.get('/api/version', async () => {
+  return { ok: true, version: 'NEW BUILD ACTIVE: GET admin routes + ESPN' };
+});
+
 // Load environment variables
 config();
 

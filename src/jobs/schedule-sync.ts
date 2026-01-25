@@ -205,7 +205,7 @@ async function upsertTeam(
   season: string,
   providerTeamId: string,
   name: string,
-shortName: shortName ?? null,
+  shortName?: string
 ): Promise<{ team: { id: string }; inserted: boolean }> {
   // Check if team exists
   const existing = await prisma.team.findUnique({
@@ -231,16 +231,22 @@ shortName: shortName ?? null,
       season,
       providerTeamId,
       name,
+      shortName: shortName ?? null,
     },
     update: {
       name,
+      shortName: shortName ?? null,
     },
   });
 
-  // Ensure season rollup exists
+  // Ensure season rollup exists (unique should be teamId+league+season in your schema)
   await prisma.teamSeasonRollup.upsert({
     where: {
-      teamId: team.id,
+      teamId_league_season: {
+        teamId: team.id,
+        league,
+        season,
+      },
     },
     create: {
       teamId: team.id,

@@ -18,6 +18,10 @@ fastify.get('/api/version', async () => {
   return { ok: true, version: 'NEW BUILD ACTIVE: GET admin routes + ESPN' };
 });
 
+fastify.get('/api/version', async () => {
+  return { ok: true, version: 'ncaa-backend CLEAN BUILD v1' };
+});
+
 // Load environment variables
 config();
 

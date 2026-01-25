@@ -2,19 +2,14 @@
   "name": "ncaa-basketball-backend",
   "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "dev": "tsx watch src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "db:generate": "prisma generate",
-    "db:push": "prisma db push",
-    "db:migrate": "prisma migrate dev",
-    "db:seed": "tsx prisma/seed.ts",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
-  },
+"scripts": {
+  "dev": "tsx watch src/index.ts",
+  "clean": "rm -rf dist",
+  "build": "npm run clean && tsc",
+  "start": "node dist/index.js",
+  "db:generate": "prisma generate",
+  "db:push": "prisma db push"
+},
   "dependencies": {
     "@fastify/cors": "^9.0.1",
     "@prisma/client": "^5.22.0",

@@ -3,6 +3,9 @@ import { getESPNClient, type ESPNEventData } from '../lib/espn.js';
 import type { League } from '../lib/types.js';
 import { League as PrismaLeague, GameStatus } from '@prisma/client';
 
+/**
+ * Sync results for a single league
+ */
 export interface LeagueSyncResult {
   teamsInserted: number;
   teamsUpdated: number;
@@ -11,34 +14,45 @@ export interface LeagueSyncResult {
   errors: string[];
 }
 
+/**
+ * Full sync results
+ */
 export interface SyncSchedulesResult {
-  startDate: string; // YYYY-MM-DD
-  endDate: string;   // YYYY-MM-DD
+  startDate: string;
+  endDate: string;
   days: number;
   mens: LeagueSyncResult;
   womens: LeagueSyncResult;
   totalErrors: string[];
 }
 
-function toYYYYMMDD(d: Date): string {
-  const year = d.getUTCFullYear();
-  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
+/**
+ * Format date as YYYYMMDD for ESPN API
+ */
+function formatDateYYYYMMDD(date: Date): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}${month}${day}`;
 }
 
-function toYYYYMMDDDash(d: Date): string {
-  return d.toISOString().split('T')[0];
-}
-
+/**
+ * Derive season string from event date
+ * Rule: if month >= 10 (Oct-Dec), season is YEAR-(YEAR+1 last2)
+ *       else (Jan-Sep), season is (YEAR-1)-YEAR last2
+ */
 function deriveSeasonFromDate(dateStr: string): string {
   const date = new Date(dateStr);
   const year = date.getUTCFullYear();
   const month = date.getUTCMonth() + 1;
+
   if (month >= 10) return `${year}-${String(year + 1).slice(2)}`;
   return `${year - 1}-${String(year).slice(2)}`;
 }
 
+/**
+ * Get the current NCAA basketball season string (e.g., "2025-26")
+ */
 export function getCurrentSeason(): string {
   const now = new Date();
   const year = now.getFullYear();
@@ -46,16 +60,23 @@ export function getCurrentSeason(): string {
 
   if (month >= 10) return `${year}-${String(year + 1).slice(2)}`;
   if (month <= 4) return `${year - 1}-${String(year).slice(2)}`;
+  // Off-season default
   return `${year}-${String(year + 1).slice(2)}`;
 }
 
+/**
+ * Map ESPN game status to our status enum
+ */
 function mapGameStatus(event: ESPNEventData): GameStatus {
   if (event.completed) return 'FINAL';
 
   switch (event.statusState) {
-    case 'post': return 'FINAL';
-    case 'in': return 'IN_PROGRESS';
-    case 'pre': return 'SCHEDULED';
+    case 'post':
+      return 'FINAL';
+    case 'in':
+      return 'IN_PROGRESS';
+    case 'pre':
+      return 'SCHEDULED';
     default: {
       const statusName = (event.statusName || '').toUpperCase();
       if (statusName.includes('POSTPONED')) return 'POSTPONED';
@@ -66,91 +87,70 @@ function mapGameStatus(event: ESPNEventData): GameStatus {
 }
 
 /**
- * Default full-season windows (you can adjust later)
- * - Men/Women both: Nov 1 → Apr 15 for that season year span
+ * Sync schedules for a date window (today → today+days-1) using ESPN scoreboard
  */
-export function getDefaultSeasonDateRange(season: string): { start: Date; end: Date } {
-  // season like "2025-26"
-  const startYear = parseInt(season.slice(0, 4), 10);
-  const endYear = startYear + 1;
-
-  // Nov 1, startYear (UTC)
-  const start = new Date(Date.UTC(startYear, 10, 1)); // month 10 = Nov
-  // Apr 15, endYear (UTC)
-  const end = new Date(Date.UTC(endYear, 3, 15)); // month 3 = Apr
-
-  return { start, end };
-}
-
-/**
- * Sync schedules by explicit date range (UTC days inclusive)
- */
-export async function syncSchedulesRange(opts: {
-  start: Date;
-  end: Date;
-  season?: string;        // optional override
-  leagues?: League[];     // default both
-}): Promise<SyncSchedulesResult> {
+export async function syncSchedules(days: number = 14): Promise<SyncSchedulesResult> {
+  console.log(`[Schedule Sync] Starting ESPN sync for ${days} days...`);
   const client = getESPNClient();
+  const today = new Date();
 
-  const startDate = new Date(Date.UTC(opts.start.getUTCFullYear(), opts.start.getUTCMonth(), opts.start.getUTCDate()));
-  const endDate = new Date(Date.UTC(opts.end.getUTCFullYear(), opts.end.getUTCMonth(), opts.end.getUTCDate()));
-
-  const msPerDay = 24 * 60 * 60 * 1000;
-  const days = Math.floor((endDate.getTime() - startDate.getTime()) / msPerDay) + 1;
+  const startDate = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const endDate = new Date(startDate);
+  endDate.setUTCDate(endDate.getUTCDate() + days - 1);
 
   const result: SyncSchedulesResult = {
-    startDate: toYYYYMMDDDash(startDate),
-    endDate: toYYYYMMDDDash(endDate),
+    startDate: startDate.toISOString().split('T')[0],
+    endDate: endDate.toISOString().split('T')[0],
     days,
     mens: { teamsInserted: 0, teamsUpdated: 0, gamesInserted: 0, gamesUpdated: 0, errors: [] },
     womens: { teamsInserted: 0, teamsUpdated: 0, gamesInserted: 0, gamesUpdated: 0, errors: [] },
     totalErrors: [],
   };
 
-  const leagues: Array<{ key: League; resultKey: 'mens' | 'womens' }> =
-    (opts.leagues?.length ? opts.leagues : (['MENS', 'WOMENS'] as League[])).map(l => ({
-      key: l,
-      resultKey: l === 'MENS' ? 'mens' : 'womens',
-    }));
-
-  console.log(`[Schedule Sync] ESPN range sync ${result.startDate} → ${result.endDate} (${days} days)`);
+  const leagues: Array<{ key: League; resultKey: 'mens' | 'womens' }> = [
+    { key: 'MENS', resultKey: 'mens' },
+    { key: 'WOMENS', resultKey: 'womens' },
+  ];
 
   for (const { key: league, resultKey } of leagues) {
-    console.log(`[Schedule Sync] Syncing ${league}...`);
+    console.log(`[Schedule Sync] Syncing ${league} league...`);
 
     for (let i = 0; i < days; i++) {
       const date = new Date(startDate);
       date.setUTCDate(date.getUTCDate() + i);
-      const dateStr = toYYYYMMDD(date);
+      const dateStr = formatDateYYYYMMDD(date);
 
       try {
         const events = await client.getScoreboard(league, dateStr);
+        console.log(`[Schedule Sync] ${league} ${dateStr}: ${events.length} events`);
 
         for (const event of events) {
           try {
-            const season = opts.season ?? deriveSeasonFromDate(event.date);
+            const season = deriveSeasonFromDate(event.date);
 
+            // Upsert home team (NO shortName in schema)
             const homeTeamResult = await upsertTeam(
               league as PrismaLeague,
               season,
               event.home.id,
               event.home.displayName,
-              event.home.abbreviation
+              event.home.conference ?? null
             );
             result[resultKey].teamsInserted += homeTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += homeTeamResult.inserted ? 0 : 1;
 
+            // Upsert away team
             const awayTeamResult = await upsertTeam(
               league as PrismaLeague,
               season,
               event.away.id,
               event.away.displayName,
-              event.away.abbreviation
+              event.away.conference ?? null
             );
             result[resultKey].teamsInserted += awayTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += awayTeamResult.inserted ? 0 : 1;
 
+            // Upsert game
             const gameResult = await upsertGame(
               league as PrismaLeague,
               season,
@@ -163,10 +163,12 @@ export async function syncSchedulesRange(opts: {
           } catch (eventError) {
             const errMsg = `Event ${event.id}: ${String(eventError)}`;
             result[resultKey].errors.push(errMsg);
-            result.totalErrors.push(errMsg);
-            console.error(`[Schedule Sync] ${league} ${dateStr} error: ${errMsg}`);
+            console.error(`[Schedule Sync] ${league} error: ${errMsg}`);
           }
         }
+
+        // small delay between dates
+        await new Promise(resolve => setTimeout(resolve, 100));
       } catch (dateError) {
         const errMsg = `${league} ${dateStr}: ${String(dateError)}`;
         result[resultKey].errors.push(errMsg);
@@ -176,30 +178,33 @@ export async function syncSchedulesRange(opts: {
     }
 
     console.log(
-      `[Schedule Sync] ${league} complete: inserted games=${result[resultKey].gamesInserted}, updated games=${result[resultKey].gamesUpdated}`
+      `[Schedule Sync] ${league} complete: ${result[resultKey].gamesInserted} inserted, ${result[resultKey].gamesUpdated} updated`
     );
   }
+
+  console.log(
+    `[Schedule Sync] Complete. Total games: ${
+      result.mens.gamesInserted +
+      result.mens.gamesUpdated +
+      result.womens.gamesInserted +
+      result.womens.gamesUpdated
+    }`
+  );
 
   return result;
 }
 
 /**
- * Convenience: sync next N days starting today (UTC)
+ * Upsert a team AND ensure TeamSeasonRollup exists.
+ * IMPORTANT: Your schema has TeamSeasonRollup.teamId @unique (not composite),
+ * so we upsert by teamId only.
  */
-export async function syncSchedules(days: number = 14): Promise<SyncSchedulesResult> {
-  const today = new Date();
-  const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-  const end = new Date(start);
-  end.setUTCDate(end.getUTCDate() + days - 1);
-  return syncSchedulesRange({ start, end });
-}
-
 async function upsertTeam(
   league: PrismaLeague,
   season: string,
   providerTeamId: string,
   name: string,
-  shortName?: string
+  conference: string | null
 ): Promise<{ team: { id: string }; inserted: boolean }> {
   const existing = await prisma.team.findUnique({
     where: {
@@ -216,33 +221,27 @@ async function upsertTeam(
       season,
       providerTeamId,
       name,
-      shortName: shortName ?? null,
+      conference,
     },
     update: {
       name,
-      shortName: shortName ?? null,
+      conference,
     },
   });
 
+  // Ensure rollup exists (by teamId ONLY per schema)
   await prisma.teamSeasonRollup.upsert({
-    where: {
-      teamId_league_season: {
-        teamId: team.id,
-        league,
-        season,
-      },
-    },
-    create: {
-      teamId: team.id,
-      league,
-      season,
-    },
-    update: {},
+    where: { teamId: team.id },
+    create: { teamId: team.id, league, season },
+    update: { league, season },
   });
 
   return { team, inserted: !existing };
 }
 
+/**
+ * Upsert a game
+ */
 async function upsertGame(
   league: PrismaLeague,
   season: string,
@@ -252,21 +251,13 @@ async function upsertGame(
 ): Promise<{ inserted: boolean }> {
   const existing = await prisma.game.findUnique({
     where: {
-      league_season_providerGameId: {
-        league,
-        season,
-        providerGameId: event.id,
-      },
+      league_season_providerGameId: { league, season, providerGameId: event.id },
     },
   });
 
   await prisma.game.upsert({
     where: {
-      league_season_providerGameId: {
-        league,
-        season,
-        providerGameId: event.id,
-      },
+      league_season_providerGameId: { league, season, providerGameId: event.id },
     },
     create: {
       league,

@@ -6,16 +6,17 @@ import { gamesRoutes } from './routes/games.js';
 import { teamsRoutes } from './routes/teams.js';
 
 import { setupJobScheduler } from './scheduler.js';
-import { syncSchedules, syncSeasonBothLeagues, getCurrentSeason } from './jobs/schedule-sync.js';
+import { syncSchedules, syncSchedulesRange, getCurrentSeason, getDefaultSeasonDateRange } from './jobs/schedule-sync.js';
 import { processCompletedGames } from './jobs/game-processor.js';
 import { buildNationalAverages } from './jobs/national-averages.js';
 
 import { runStartupBootstrap, getBootstrapStatus } from './bootstrap.js';
 import { prisma } from './lib/prisma.js';
 
+// Load env
 config();
 
-console.log('*** CLEAN BACKEND INDEX ACTIVE: 2026-01-26 (SYNC-SEASON) ***');
+console.log('*** CLEAN BACKEND INDEX ACTIVE: 2026-01-26 ***');
 
 const fastify = Fastify({ logger: true });
 
@@ -24,31 +25,27 @@ await fastify.register(cors, {
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
 });
 
-// Register main API routes
+// Main API routes (these define /api/:league/:season/...)
 await fastify.register(gamesRoutes);
 await fastify.register(teamsRoutes);
 
-// ---------- Health + Version ----------
+// -------------------- Health + Version --------------------
 fastify.get('/health', async () => ({ ok: true, season: getCurrentSeason() }));
 fastify.get('/api/health', async () => ({ ok: true, season: getCurrentSeason() }));
 
 fastify.get('/api/version', async () => ({
   ok: true,
-  version: 'CLEAN BACKEND INDEX ACTIVE: 2026-01-26 (SYNC-SEASON)',
+  version: 'CLEAN BACKEND INDEX ACTIVE: 2026-01-26',
   season: getCurrentSeason(),
 }));
 
-// ============ Admin Endpoints ============
-
-// Bootstrap status
+// -------------------- Admin: Bootstrap status --------------------
 fastify.get('/api/admin/bootstrap-status', async () => getBootstrapStatus());
 
-/**
- * Reset DB (DANGEROUS): deletes all rows from game/team/stats/rollups/nationals
- * Call: /api/admin/reset-db?confirm=YES
- */
-fastify.get('/api/admin/reset-db', async (request: any, reply: any) => {
-  const confirm = String((request.query as any)?.confirm ?? '');
+// -------------------- Admin: Reset DB --------------------
+fastify.get('/api/admin/reset-db', async (request, reply) => {
+  const confirm = (request.query as any)?.confirm;
+
   if (confirm !== 'YES') {
     return reply.status(400).send({
       ok: false,
@@ -57,14 +54,12 @@ fastify.get('/api/admin/reset-db', async (request: any, reply: any) => {
     });
   }
 
-  const [teamGameStatsDeleted, gamesDeleted, rollupsDeleted, nationalsDeleted, teamsDeleted] =
-    await prisma.$transaction([
-      prisma.teamGameStats.deleteMany({}),
-      prisma.game.deleteMany({}),
-      prisma.teamSeasonRollup.deleteMany({}),
-      prisma.nationalAverages.deleteMany({}),
-      prisma.team.deleteMany({}),
-    ]);
+  // Order matters due to FKs
+  const teamGameStatsDeleted = await prisma.teamGameStats.deleteMany({});
+  const gamesDeleted = await prisma.game.deleteMany({});
+  const rollupsDeleted = await prisma.teamSeasonRollup.deleteMany({});
+  const nationalsDeleted = await prisma.nationalAverages.deleteMany({});
+  const teamsDeleted = await prisma.team.deleteMany({});
 
   return {
     ok: true,
@@ -84,122 +79,161 @@ fastify.get('/api/admin/reset-db', async (request: any, reply: any) => {
   };
 });
 
-/**
- * Sync schedules for next N days (both leagues via your syncSchedules(days) helper)
- * Call: /api/admin/sync-schedules?days=14
- */
-fastify.get('/api/admin/sync-schedules', async (request: any, reply: any) => {
+// -------------------- Admin: Small-window schedule sync --------------------
+fastify.get('/api/admin/sync-schedules', async (request, reply) => {
   try {
     const days = Number((request.query as any)?.days ?? 14);
     if (!Number.isFinite(days) || days < 1 || days > 120) {
-      return reply.status(400).send({ ok: false, error: 'Invalid days. Must be 1-120.' });
+      return reply.status(400).send({ ok: false, error: 'days must be 1..120' });
     }
     const results = await syncSchedules(days);
     return { ok: true, days, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Schedule sync failed', details: String(error) });
+  } catch (err) {
+    return reply.status(500).send({ ok: false, error: 'sync-schedules failed', details: String(err) });
   }
 });
 
-fastify.post('/api/admin/sync-schedules', async (request: any, reply: any) => {
-  try {
-    const days = Number((request.query as any)?.days ?? 14);
-    if (!Number.isFinite(days) || days < 1 || days > 120) {
-      return reply.status(400).send({ ok: false, error: 'Invalid days. Must be 1-120.' });
-    }
-    const results = await syncSchedules(days);
-    return { ok: true, days, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Schedule sync failed', details: String(error) });
-  }
-});
+// -------------------- Admin: FULL SEASON sync (BOTH leagues) --------------------
+// In-memory status so you can check progress without watching logs
+type SeasonSyncStatus = {
+  isRunning: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  lastError: string | null;
+  lastResult: any | null;
+};
+let seasonSyncStatus: SeasonSyncStatus = {
+  isRunning: false,
+  startedAt: null,
+  finishedAt: null,
+  lastError: null,
+  lastResult: null,
+};
+
+fastify.get('/api/admin/sync-season-status', async () => seasonSyncStatus);
 
 /**
- * NEW: Sync FULL SEASON for BOTH leagues (Division I via ESPN groups=50)
- *
- * Call (recommended):
- *   /api/admin/sync-season?season=2025-26
- *
- * Optional overrides:
- *   /api/admin/sync-season?season=2025-26&start=2025-11-01&end=2026-04-15
+ * GET /api/admin/sync-season?season=2025-26
+ * Optional:
+ *   start=YYYY-MM-DD
+ *   end=YYYY-MM-DD
+ * Runs BOTH leagues by default
  */
-fastify.get('/api/admin/sync-season', async (request: any, reply: any) => {
-  try {
-    const season = String((request.query as any)?.season ?? getCurrentSeason());
-    const start = (request.query as any)?.start ? String((request.query as any)?.start) : undefined;
-    const end = (request.query as any)?.end ? String((request.query as any)?.end) : undefined;
+fastify.get('/api/admin/sync-season', async (request, reply) => {
+  const q = request.query as any;
+  const season = String(q?.season ?? getCurrentSeason());
 
-    const results = await syncSeasonBothLeagues(season, start, end);
-    return { ok: true, season, start: results.startDate, end: results.endDate, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Season sync failed', details: String(error) });
+  let start: Date;
+  let end: Date;
+
+  if (q?.start && q?.end) {
+    start = new Date(`${q.start}T00:00:00.000Z`);
+    end = new Date(`${q.end}T00:00:00.000Z`);
+  } else {
+    const def = getDefaultSeasonDateRange(season);
+    start = def.start;
+    end = def.end;
   }
+
+  // Run in background so the HTTP request doesn’t time out
+  if (seasonSyncStatus.isRunning) {
+    return reply.status(409).send({
+      ok: false,
+      error: 'sync-season already running',
+      status: seasonSyncStatus,
+    });
+  }
+
+  seasonSyncStatus = {
+    isRunning: true,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    lastError: null,
+    lastResult: null,
+  };
+
+  setImmediate(async () => {
+    try {
+      console.log(`[Admin] sync-season starting for ${season} (${start.toISOString().slice(0,10)} → ${end.toISOString().slice(0,10)})`);
+      const res = await syncSchedulesRange({ start, end, season });
+      seasonSyncStatus.lastResult = res;
+      seasonSyncStatus.finishedAt = new Date().toISOString();
+      console.log('[Admin] sync-season finished');
+    } catch (err) {
+      seasonSyncStatus.lastError = String(err);
+      seasonSyncStatus.finishedAt = new Date().toISOString();
+      console.error('[Admin] sync-season failed:', err);
+    } finally {
+      seasonSyncStatus.isRunning = false;
+    }
+  });
+
+  return {
+    ok: true,
+    message: 'sync-season started in background',
+    season,
+    range: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) },
+    statusEndpoint: '/api/admin/sync-season-status',
+  };
 });
 
-fastify.post('/api/admin/sync-season', async (request: any, reply: any) => {
-  try {
-    const season = String((request.query as any)?.season ?? getCurrentSeason());
-    const start = (request.query as any)?.start ? String((request.query as any)?.start) : undefined;
-    const end = (request.query as any)?.end ? String((request.query as any)?.end) : undefined;
-
-    const results = await syncSeasonBothLeagues(season, start, end);
-    return { ok: true, season, start: results.startDate, end: results.endDate, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Season sync failed', details: String(error) });
-  }
-});
-
-// Process completed games (stats ingestion)
-fastify.get('/api/admin/process-completed-games', async (_request: any, reply: any) => {
+// -------------------- Admin: Game processing (stats ingestion) --------------------
+fastify.get('/api/admin/process-completed-games', async (_request, reply) => {
   try {
     const results = await processCompletedGames();
     return { ok: true, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Game processing failed', details: String(error) });
+  } catch (err) {
+    return reply.status(500).send({ ok: false, error: 'process-completed-games failed', details: String(err) });
   }
 });
 
-fastify.post('/api/admin/process-completed-games', async (_request: any, reply: any) => {
+// -------------------- Admin: Build averages --------------------
+fastify.get('/api/admin/build-averages', async (_request, reply) => {
+  try {
+    const results = await buildNationalAverages();
+    return { ok: true, season: getCurrentSeason(), results };
+  } catch (err) {
+    return reply.status(500).send({ ok: false, error: 'build-averages failed', details: String(err) });
+  }
+});
+
+// -------------------- Legacy POST endpoints (optional) --------------------
+fastify.post('/api/admin/jobs/sync-schedules', async (_request, reply) => {
+  try {
+    const results = await syncSchedules(14);
+    return { ok: true, results };
+  } catch (err) {
+    return reply.status(500).send({ ok: false, error: 'legacy sync failed', details: String(err) });
+  }
+});
+
+fastify.post('/api/admin/jobs/process-games', async (_request, reply) => {
   try {
     const results = await processCompletedGames();
     return { ok: true, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Game processing failed', details: String(error) });
+  } catch (err) {
+    return reply.status(500).send({ ok: false, error: 'legacy processor failed', details: String(err) });
   }
 });
 
-// Build national averages
-fastify.get('/api/admin/build-averages', async (_request: any, reply: any) => {
+fastify.post('/api/admin/jobs/build-averages', async (_request, reply) => {
   try {
     const results = await buildNationalAverages();
-    return { ok: true, season: getCurrentSeason(), results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'National averages build failed', details: String(error) });
+    return { ok: true, results };
+  } catch (err) {
+    return reply.status(500).send({ ok: false, error: 'legacy averages failed', details: String(err) });
   }
 });
 
-fastify.post('/api/admin/build-averages', async (_request: any, reply: any) => {
-  try {
-    const results = await buildNationalAverages();
-    return { ok: true, season: getCurrentSeason(), results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'National averages build failed', details: String(error) });
-  }
-});
-
-// Start server
+// -------------------- Start server --------------------
 const port = parseInt(process.env.PORT || '8080', 10);
 const host = process.env.HOST || '0.0.0.0';
 
 try {
-  // Start scheduler (cron jobs)
   setupJobScheduler();
-
-  // Start server
   await fastify.listen({ port, host });
   fastify.log.info(`Server listening at http://${host}:${port}`);
 
-  // Run initial bootstrap (non-blocking)
   runStartupBootstrap();
 } catch (err) {
   fastify.log.error(err);

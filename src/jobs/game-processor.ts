@@ -48,17 +48,26 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
     try {
       console.log(`[Game Processor] Processing ${game.providerGameId}: ${game.awayTeam.name} @ ${game.homeTeam.name}`);
 
-      // Fetch game details from ESPN
+      // Fetch game details from ESPN (parsed boxscore)
       const boxscore = await client.getGameSummary(game.league as PrismaLeague, game.providerGameId);
 
-      if (!boxscore || !boxscore.home.statistics || !boxscore.away.statistics) {
-        console.log(`[Game Processor] No statistics available for ${game.providerGameId}, skipping`);
+      if (!boxscore) {
+        console.log(`[Game Processor] No boxscore returned for ${game.providerGameId}, skipping`);
         result.gamesSkipped++;
         continue;
       }
 
+      // ESPN sometimes fails to attach statistics for one/both teams
       const homeStats = boxscore.home.statistics;
       const awayStats = boxscore.away.statistics;
+
+      if (!homeStats || !awayStats) {
+        console.log(
+          `[Game Processor] Missing stats for ${game.providerGameId}. homeStats=${!!homeStats} awayStats=${!!awayStats}. Skipping.`
+        );
+        result.gamesSkipped++;
+        continue;
+      }
 
       // Compute 2PT from FG and 3PT: 2PTM = FGM - 3PTM, 2PTA = FGA - 3PTA
       const home2pt = derive2ptFromFg(
@@ -75,7 +84,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
         awayStats.three_points_att
       );
 
-      // Create team game stats for home team
+      // Upsert team game stats for HOME team
       await prisma.teamGameStats.upsert({
         where: {
           gameId_teamId: {
@@ -89,14 +98,16 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           opponentId: game.awayTeamId,
           league: game.league,
           season: game.season,
-          // Home team offensive stats (what they scored)
+
+          // Home team offensive stats
           off2ptm: home2pt.twoPtm,
           off2pta: home2pt.twoPta,
           off3ptm: homeStats.three_points_made,
           off3pta: homeStats.three_points_att,
           offFtm: homeStats.free_throws_made,
           offFta: homeStats.free_throws_att,
-          // Home team defensive stats (what opponent scored = what home allowed)
+
+          // Home team defensive stats (what opponent scored)
           def2ptmAllowed: away2pt.twoPtm,
           def2ptaAllowed: away2pt.twoPta,
           def3ptmAllowed: awayStats.three_points_made,
@@ -120,7 +131,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
         },
       });
 
-      // Create team game stats for away team
+      // Upsert team game stats for AWAY team
       await prisma.teamGameStats.upsert({
         where: {
           gameId_teamId: {
@@ -134,14 +145,16 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           opponentId: game.homeTeamId,
           league: game.league,
           season: game.season,
-          // Away team offensive stats (what they scored)
+
+          // Away team offensive stats
           off2ptm: away2pt.twoPtm,
           off2pta: away2pt.twoPta,
           off3ptm: awayStats.three_points_made,
           off3pta: awayStats.three_points_att,
           offFtm: awayStats.free_throws_made,
           offFta: awayStats.free_throws_att,
-          // Away team defensive stats (what home scored = what away allowed)
+
+          // Away team defensive stats (what home scored)
           def2ptmAllowed: home2pt.twoPtm,
           def2ptaAllowed: home2pt.twoPta,
           def3ptmAllowed: homeStats.three_points_made,
@@ -165,11 +178,11 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
         },
       });
 
-      // Update season rollups for both teams (incremental update)
-      await updateTeamSeasonRollup(game.homeTeamId, game.league, game.season);
-      await updateTeamSeasonRollup(game.awayTeamId, game.league, game.season);
+      // Update season rollups for both teams (aggregate update)
+      await updateTeamSeasonRollup(game.homeTeamId, game.league as PrismaLeague, game.season);
+      await updateTeamSeasonRollup(game.awayTeamId, game.league as PrismaLeague, game.season);
 
-      // Mark game as processed with timestamp
+      // Mark game as processed + ensure scores are stored
       await prisma.game.update({
         where: { id: game.id },
         data: {
@@ -188,26 +201,19 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
     }
   }
 
-  console.log(`[Game Processor] Complete. Processed: ${result.gamesProcessed}, Skipped: ${result.gamesSkipped}, Errors: ${result.errors.length}`);
+  console.log(
+    `[Game Processor] Complete. Processed: ${result.gamesProcessed}, Skipped: ${result.gamesSkipped}, Errors: ${result.errors.length}`
+  );
   return result;
 }
 
 /**
  * Update a team's season rollup by aggregating all their game stats
  */
-async function updateTeamSeasonRollup(
-  teamId: string,
-  league: PrismaLeague,
-  season: string
-): Promise<void> {
-  // Aggregate all game stats for this team
+async function updateTeamSeasonRollup(teamId: string, league: PrismaLeague, season: string): Promise<void> {
   const stats = await prisma.teamGameStats.aggregate({
-    where: {
-      teamId,
-      league,
-      season,
-    },
-    _count: true,
+    where: { teamId, league, season },
+    _count: { _all: true },
     _sum: {
       off2ptm: true,
       off2pta: true,
@@ -224,13 +230,15 @@ async function updateTeamSeasonRollup(
     },
   });
 
+  const gamesPlayed = stats._count._all;
+
   await prisma.teamSeasonRollup.upsert({
     where: { teamId },
     create: {
       teamId,
       league,
       season,
-      gamesPlayed: stats._count,
+      gamesPlayed,
       off2ptmTotal: stats._sum.off2ptm ?? 0,
       off2ptaTotal: stats._sum.off2pta ?? 0,
       off3ptmTotal: stats._sum.off3ptm ?? 0,
@@ -245,7 +253,7 @@ async function updateTeamSeasonRollup(
       defFtaAllowedTotal: stats._sum.defFtaAllowed ?? 0,
     },
     update: {
-      gamesPlayed: stats._count,
+      gamesPlayed,
       off2ptmTotal: stats._sum.off2ptm ?? 0,
       off2ptaTotal: stats._sum.off2pta ?? 0,
       off3ptmTotal: stats._sum.off3ptm ?? 0,

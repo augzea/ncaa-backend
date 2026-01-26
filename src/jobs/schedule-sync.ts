@@ -60,8 +60,23 @@ export function getCurrentSeason(): string {
 
   if (month >= 10) return `${year}-${String(year + 1).slice(2)}`;
   if (month <= 4) return `${year - 1}-${String(year).slice(2)}`;
-  // Off-season default
   return `${year}-${String(year + 1).slice(2)}`;
+}
+
+/**
+ * Default date range for a season (inclusive start/end, UTC)
+ * Example season "2025-26" => 2025-11-01 .. 2026-04-15
+ */
+export function getDefaultSeasonDateRange(season: string): { start: Date; end: Date } {
+  // season = "YYYY-YY"
+  const startYear = Number(season.slice(0, 4));
+  const endYear = startYear + 1;
+
+  // You can adjust these if you want earlier/later coverage
+  const start = new Date(Date.UTC(startYear, 10, 1)); // Nov 1
+  const end = new Date(Date.UTC(endYear, 3, 15));    // Apr 15
+
+  return { start, end };
 }
 
 /**
@@ -87,16 +102,41 @@ function mapGameStatus(event: ESPNEventData): GameStatus {
 }
 
 /**
- * Sync schedules for a date window (today → today+days-1) using ESPN scoreboard
+ * Sync schedules for a date window (today → today+days-1)
  */
 export async function syncSchedules(days: number = 14): Promise<SyncSchedulesResult> {
-  console.log(`[Schedule Sync] Starting ESPN sync for ${days} days...`);
-  const client = getESPNClient();
   const today = new Date();
-
   const startDate = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
   const endDate = new Date(startDate);
   endDate.setUTCDate(endDate.getUTCDate() + days - 1);
+
+  return syncSchedulesRange({
+    start: startDate,
+    end: endDate,
+    season: getCurrentSeason(),
+  });
+}
+
+/**
+ * Sync schedules for an explicit date range (inclusive), BOTH leagues.
+ * This is what your /api/admin/sync-season endpoint should call.
+ */
+export async function syncSchedulesRange(args: {
+  start: Date;
+  end: Date;
+  season: string;
+}): Promise<SyncSchedulesResult> {
+  const { start, end } = args;
+
+  const client = getESPNClient();
+
+  const startDate = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const endDate = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+
+  const msPerDay = 24 * 60 * 60 * 1000;
+  const days = Math.floor((endDate.getTime() - startDate.getTime()) / msPerDay) + 1;
+
+  console.log(`[Schedule Sync] Starting ESPN sync for range ${startDate.toISOString().slice(0, 10)} → ${endDate.toISOString().slice(0, 10)} (${days} days)`);
 
   const result: SyncSchedulesResult = {
     startDate: startDate.toISOString().split('T')[0],
@@ -115,9 +155,9 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
   for (const { key: league, resultKey } of leagues) {
     console.log(`[Schedule Sync] Syncing ${league} league...`);
 
-    for (let i = 0; i < days; i++) {
+    for (let offset = 0; offset < days; offset++) {
       const date = new Date(startDate);
-      date.setUTCDate(date.getUTCDate() + i);
+      date.setUTCDate(date.getUTCDate() + offset);
       const dateStr = formatDateYYYYMMDD(date);
 
       try {
@@ -126,9 +166,9 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
 
         for (const event of events) {
           try {
+            // ESPN event.date tells us season boundaries too, but we store season derived from event date
             const season = deriveSeasonFromDate(event.date);
 
-            // Upsert home team (NO shortName in schema)
             const homeTeamResult = await upsertTeam(
               league as PrismaLeague,
               season,
@@ -139,7 +179,6 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
             result[resultKey].teamsInserted += homeTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += homeTeamResult.inserted ? 0 : 1;
 
-            // Upsert away team
             const awayTeamResult = await upsertTeam(
               league as PrismaLeague,
               season,
@@ -150,7 +189,6 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
             result[resultKey].teamsInserted += awayTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += awayTeamResult.inserted ? 0 : 1;
 
-            // Upsert game
             const gameResult = await upsertGame(
               league as PrismaLeague,
               season,
@@ -167,7 +205,6 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
           }
         }
 
-        // small delay between dates
         await new Promise(resolve => setTimeout(resolve, 100));
       } catch (dateError) {
         const errMsg = `${league} ${dateStr}: ${String(dateError)}`;
@@ -176,10 +213,6 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
         console.error(`[Schedule Sync] Error: ${errMsg}`);
       }
     }
-
-    console.log(
-      `[Schedule Sync] ${league} complete: ${result[resultKey].gamesInserted} inserted, ${result[resultKey].gamesUpdated} updated`
-    );
   }
 
   console.log(
@@ -195,9 +228,8 @@ export async function syncSchedules(days: number = 14): Promise<SyncSchedulesRes
 }
 
 /**
- * Upsert a team AND ensure TeamSeasonRollup exists.
- * IMPORTANT: Your schema has TeamSeasonRollup.teamId @unique (not composite),
- * so we upsert by teamId only.
+ * Upsert a team and ensure TeamSeasonRollup exists.
+ * Your schema has TeamSeasonRollup.teamId @unique so we upsert by teamId only.
  */
 async function upsertTeam(
   league: PrismaLeague,
@@ -207,29 +239,15 @@ async function upsertTeam(
   conference: string | null
 ): Promise<{ team: { id: string }; inserted: boolean }> {
   const existing = await prisma.team.findUnique({
-    where: {
-      league_season_providerTeamId: { league, season, providerTeamId },
-    },
+    where: { league_season_providerTeamId: { league, season, providerTeamId } },
   });
 
   const team = await prisma.team.upsert({
-    where: {
-      league_season_providerTeamId: { league, season, providerTeamId },
-    },
-    create: {
-      league,
-      season,
-      providerTeamId,
-      name,
-      conference,
-    },
-    update: {
-      name,
-      conference,
-    },
+    where: { league_season_providerTeamId: { league, season, providerTeamId } },
+    create: { league, season, providerTeamId, name, conference },
+    update: { name, conference },
   });
 
-  // Ensure rollup exists (by teamId ONLY per schema)
   await prisma.teamSeasonRollup.upsert({
     where: { teamId: team.id },
     create: { teamId: team.id, league, season },
@@ -250,15 +268,11 @@ async function upsertGame(
   awayTeamId: string
 ): Promise<{ inserted: boolean }> {
   const existing = await prisma.game.findUnique({
-    where: {
-      league_season_providerGameId: { league, season, providerGameId: event.id },
-    },
+    where: { league_season_providerGameId: { league, season, providerGameId: event.id } },
   });
 
   await prisma.game.upsert({
-    where: {
-      league_season_providerGameId: { league, season, providerGameId: event.id },
-    },
+    where: { league_season_providerGameId: { league, season, providerGameId: event.id } },
     create: {
       league,
       season,

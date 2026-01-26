@@ -4,18 +4,18 @@ const ESPN_MBB_SCOREBOARD_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard';
 const ESPN_WBB_SCOREBOARD_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball/scoreboard';
+
 const ESPN_MBB_GAME_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/summary';
 const ESPN_WBB_GAME_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball/summary';
 
-const FETCH_TIMEOUT_MS = 10000;
+const FETCH_TIMEOUT_MS = 10000; // 10 seconds
 const MAX_RETRIES = 3;
+const RATE_LIMIT_MIN_MS = 300;
+const RATE_LIMIT_MAX_MS = 500;
 
-// =======================
-// Types
-// =======================
-
+// Exported types for ESPN data
 export interface ESPNTeamData {
   id: string;
   name: string;
@@ -27,7 +27,7 @@ export interface ESPNTeamData {
 }
 
 export interface ESPNEventData {
-  id: string;
+  id: string; // ESPN event id (numeric string)
   date: string;
   completed: boolean;
   statusState: 'pre' | 'in' | 'post';
@@ -48,33 +48,37 @@ export interface ESPNBoxscoreStats {
 }
 
 export interface ESPNBoxscore {
-  id: string;
+  id: string; // ESPN event id
   status: string;
   home: {
-    id: string;
+    id: string; // team id
     name: string;
     statistics: ESPNBoxscoreStats | undefined;
   };
   away: {
-    id: string;
+    id: string; // team id
     name: string;
     statistics: ESPNBoxscoreStats | undefined;
   };
 }
 
-// =======================
-// Utility
-// =======================
-
+/**
+ * Sleep helper
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// =======================
-// Client
-// =======================
+/**
+ * Random delay between min and max ms
+ */
+function randomDelay(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
 
 export class ESPNClient {
+  private lastRequestTime: number = 0;
+
   private getScoreboardUrl(league: League): string {
     return league === 'MENS' ? ESPN_MBB_SCOREBOARD_URL : ESPN_WBB_SCOREBOARD_URL;
   }
@@ -83,7 +87,26 @@ export class ESPNClient {
     return league === 'MENS' ? ESPN_MBB_GAME_URL : ESPN_WBB_GAME_URL;
   }
 
+  /**
+   * Rate limit: ensure minimum delay between requests
+   */
+  private async rateLimit(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - this.lastRequestTime;
+    const delay = randomDelay(RATE_LIMIT_MIN_MS, RATE_LIMIT_MAX_MS);
+
+    if (elapsed < delay) {
+      await sleep(delay - elapsed);
+    }
+    this.lastRequestTime = Date.now();
+  }
+
+  /**
+   * Fetch with timeout + retries
+   */
   private async fetchWithRetry<T>(url: string, retries: number = MAX_RETRIES): Promise<T> {
+    await this.rateLimit();
+
     let lastError: Error | null = null;
 
     for (let attempt = 1; attempt <= retries; attempt++) {
@@ -99,115 +122,178 @@ export class ESPNClient {
         clearTimeout(timeoutId);
 
         if (!response.ok) {
-          throw new Error(`ESPN API error: HTTP ${response.status}`);
+          const text = await response.text().catch(() => 'No response body');
+          throw new Error(
+            `ESPN API error: HTTP ${response.status} ${response.statusText} - ${text.slice(0, 200)}`
+          );
         }
 
         return (await response.json()) as T;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+
+        if (lastError.name === 'AbortError') {
+          lastError = new Error(`ESPN API timeout after ${FETCH_TIMEOUT_MS}ms`);
+        }
 
         if (attempt < retries) {
-          await sleep(attempt * 1000);
+          const backoff = attempt * 1000; // 1s, 2s, 3s
+          console.log(`[ESPN] Retry ${attempt}/${retries} for ${url} after ${backoff}ms: ${lastError.message}`);
+          await sleep(backoff);
         }
       }
     }
 
-    throw lastError;
+    throw lastError ?? new Error('Unknown ESPN fetch error');
   }
 
+  /**
+   * Get scoreboard for a specific date
+   */
   async getScoreboard(league: League, dateYYYYMMDD: string): Promise<ESPNEventData[]> {
-    const url = `${this.getScoreboardUrl(league)}?dates=${dateYYYYMMDD}`;
+    const baseUrl = this.getScoreboardUrl(league);
+    const url = `${baseUrl}?dates=${dateYYYYMMDD}`;
+
     const response = await this.fetchWithRetry<ESPNScoreboardResponse>(url);
     return this.parseScoreboardEvents(response.events || []);
   }
 
+  /**
+   * Get game details/boxscore for an event
+   */
   async getGameDetails(league: League, eventId: string): Promise<ESPNGameDetailsResponse> {
-    const url = `${this.getGameUrl(league)}?event=${eventId}`;
+    const baseUrl = this.getGameUrl(league);
+    const url = `${baseUrl}?event=${eventId}`;
     return this.fetchWithRetry<ESPNGameDetailsResponse>(url);
   }
 
+  /**
+   * Get game summary parsed into our boxscore
+   */
   async getGameSummary(league: League, gameId: string): Promise<ESPNBoxscore | null> {
     try {
       const response = await this.getGameDetails(league, gameId);
       return this.parseGameSummary(response, gameId);
-    } catch {
+    } catch (error) {
+      console.error(`[ESPN] Error fetching game summary for ${gameId}:`, error);
       return null;
     }
   }
 
+  /**
+   * Parse scoreboard events into normalized format
+   */
   private parseScoreboardEvents(events: ESPNEvent[]): ESPNEventData[] {
     return events.map(event => {
       const competition = event.competitions?.[0];
-      if (!competition) throw new Error(`No competition for event ${event.id}`);
+      if (!competition) throw new Error(`No competition found for event ${event.id}`);
 
-      const home = competition.competitors?.find(c => c.homeAway === 'home');
-      const away = competition.competitors?.find(c => c.homeAway === 'away');
-      if (!home || !away) throw new Error(`Missing teams for event ${event.id}`);
+      const homeCompetitor = competition.competitors?.find(c => c.homeAway === 'home');
+      const awayCompetitor = competition.competitors?.find(c => c.homeAway === 'away');
+      if (!homeCompetitor || !awayCompetitor) throw new Error(`Missing home/away for event ${event.id}`);
 
-      const parseTeam = (c: ESPNCompetitor): ESPNTeamData => ({
-        id: c.team?.id || c.id,
-        name: c.team?.name || c.name || 'Unknown',
-        displayName: c.team?.displayName || 'Unknown',
-        shortDisplayName: c.team?.shortDisplayName || 'UNK',
-        abbreviation: c.team?.abbreviation || 'UNK',
-        conference: null,
-        score: c.score ? parseInt(c.score, 10) : undefined,
-      });
+      const parseTeam = (competitor: ESPNCompetitor): ESPNTeamData => {
+        const team = competitor.team;
+        return {
+          id: team?.id || competitor.id,
+          name: team?.name || competitor.name || 'Unknown',
+          displayName:
+            team?.displayName ||
+            `${team?.location || ''} ${team?.name || ''}`.trim() ||
+            'Unknown',
+          shortDisplayName: team?.shortDisplayName || team?.abbreviation || team?.name || 'UNK',
+          abbreviation: team?.abbreviation || competitor.abbreviation || 'UNK',
+          conference: null, // ESPN "conferenceId" here isn't reliable; keep null unless you map it
+          score: competitor.score ? parseInt(competitor.score, 10) : undefined,
+        };
+      };
 
-      const status = competition.status?.type;
+      const statusType = competition.status?.type;
+      const completed = statusType?.completed === true || statusType?.state === 'post';
 
       return {
-        id: event.id,
+        id: event.id, // <-- ESPN event id (numeric string)
         date: event.date,
-        completed: status?.completed || false,
-        statusState: (status?.state as any) || 'pre',
-        statusName: status?.name || 'SCHEDULED',
+        completed,
+        statusState: (statusType?.state as 'pre' | 'in' | 'post') || 'pre',
+        statusName: statusType?.name || 'STATUS_UNKNOWN',
         neutralSite: competition.neutralSite || false,
-        home: parseTeam(home),
-        away: parseTeam(away),
+        home: parseTeam(homeCompetitor),
+        away: parseTeam(awayCompetitor),
       };
     });
   }
 
+  /**
+   * Parse game summary into boxscore format.
+   * IMPORTANT: competitor.id is NOT team.id. Use competitor.team.id.
+   */
   private parseGameSummary(response: ESPNGameDetailsResponse, gameId: string): ESPNBoxscore | null {
-    const teams = response.boxscore?.teams;
-    if (!teams || teams.length < 2) return null;
+    const boxscore = response.boxscore;
+    if (!boxscore?.teams || boxscore.teams.length < 2) return null;
+
+    const competition = response.header?.competitions?.[0];
+    const competitors = competition?.competitors ?? [];
+
+    const homeTeamId = competitors.find(c => c.homeAway === 'home')?.team?.id;
+    const awayTeamId = competitors.find(c => c.homeAway === 'away')?.team?.id;
+
+    const homeTeam = homeTeamId ? boxscore.teams.find(t => t.team?.id === homeTeamId) : undefined;
+    const awayTeam = awayTeamId ? boxscore.teams.find(t => t.team?.id === awayTeamId) : undefined;
+
+    // Safe fallback
+    const safeHome = homeTeam ?? boxscore.teams[1] ?? boxscore.teams[0];
+    const safeAway = awayTeam ?? boxscore.teams[0] ?? boxscore.teams[1];
+
+    const homeStats = this.extractTeamStats(safeHome?.statistics || []);
+    const awayStats = this.extractTeamStats(safeAway?.statistics || []);
 
     return {
       id: gameId,
-      status: 'FINAL',
+      status: competition?.status?.type?.name || 'STATUS_UNKNOWN',
       home: {
-        id: teams[1]?.team?.id || '',
-        name: teams[1]?.team?.displayName || '',
-        statistics: this.extractTeamStats(teams[1]?.statistics || []),
+        id: safeHome?.team?.id || '',
+        name: safeHome?.team?.displayName || safeHome?.team?.name || 'Unknown',
+        statistics: homeStats,
       },
       away: {
-        id: teams[0]?.team?.id || '',
-        name: teams[0]?.team?.displayName || '',
-        statistics: this.extractTeamStats(teams[0]?.statistics || []),
+        id: safeAway?.team?.id || '',
+        name: safeAway?.team?.displayName || safeAway?.team?.name || 'Unknown',
+        statistics: awayStats,
       },
     };
   }
 
-  private extractTeamStats(stats: ESPNStatistic[]): ESPNBoxscoreStats | undefined {
-    const map: Record<string, string> = {};
-    for (const s of stats) {
-      if (s.name && s.displayValue) {
-        map[s.name] = s.displayValue;
+  /**
+   * Extract shooting stats from ESPN team statistics array.
+   * Uses the common ESPN displayValue formats like "30-62".
+   */
+  private extractTeamStats(statistics: ESPNStatistic[]): ESPNBoxscoreStats | undefined {
+    const statMap: Record<string, string> = {};
+
+    for (const stat of statistics) {
+      if (stat.name && stat.displayValue !== undefined) {
+        statMap[stat.name] = stat.displayValue;
       }
     }
 
-    const parse = (key: string) => parseInt(map[key] || '0', 10);
+    const fgParts = (statMap['fieldGoalsMade-fieldGoalsAttempted'] || statMap['fieldGoals'] || '0-0').split('-');
+    const fg3Parts =
+      (statMap['threePointFieldGoalsMade-threePointFieldGoalsAttempted'] ||
+        statMap['threePointFieldGoals'] ||
+        '0-0').split('-');
+    const ftParts = (statMap['freeThrowsMade-freeThrowsAttempted'] || statMap['freeThrows'] || '0-0').split('-');
 
-    const fgm = parse('fieldGoalsMade');
-    const fga = parse('fieldGoalsAttempted');
-    const fg3m = parse('threePointFieldGoalsMade');
-    const fg3a = parse('threePointFieldGoalsAttempted');
-    const ftm = parse('freeThrowsMade');
-    const fta = parse('freeThrowsAttempted');
-    const pts = parse('points');
+    const fgm = parseInt(statMap['fieldGoalsMade'] || fgParts[0] || '0', 10);
+    const fga = parseInt(statMap['fieldGoalsAttempted'] || fgParts[1] || '0', 10);
+    const fg3m = parseInt(statMap['threePointFieldGoalsMade'] || fg3Parts[0] || '0', 10);
+    const fg3a = parseInt(statMap['threePointFieldGoalsAttempted'] || fg3Parts[1] || '0', 10);
+    const ftm = parseInt(statMap['freeThrowsMade'] || ftParts[0] || '0', 10);
+    const fta = parseInt(statMap['freeThrowsAttempted'] || ftParts[1] || '0', 10);
+    const points = parseInt(statMap['points'] || statMap['totalPoints'] || '0', 10);
 
-    if (fga === 0 && fta === 0) return undefined;
+    // If there is literally no attempt data, treat as missing
+    if (fga === 0 && fg3a === 0 && fta === 0) return undefined;
 
     return {
       field_goals_made: fgm,
@@ -216,24 +302,19 @@ export class ESPNClient {
       three_points_att: fg3a,
       free_throws_made: ftm,
       free_throws_att: fta,
-      points: pts,
+      points,
     };
   }
 }
 
-// =======================
-// Singleton
-// =======================
-
-let client: ESPNClient | null = null;
+// Singleton instance
+let clientInstance: ESPNClient | null = null;
 export function getESPNClient(): ESPNClient {
-  if (!client) client = new ESPNClient();
-  return client;
+  if (!clientInstance) clientInstance = new ESPNClient();
+  return clientInstance;
 }
 
-// =======================
-// ESPN Raw Types
-// =======================
+// ============ Internal ESPN API response types ============
 
 interface ESPNScoreboardResponse {
   events?: ESPNEvent[];
@@ -258,28 +339,42 @@ interface ESPNCompetition {
 }
 
 interface ESPNCompetitor {
-  id: string;
+  id: string; // competitor id (NOT team id)
   homeAway: 'home' | 'away';
   score?: string;
   name?: string;
+  abbreviation?: string;
   team?: {
-    id: string;
+    id: string; // team id
     name?: string;
+    location?: string;
+    abbreviation?: string;
     displayName?: string;
     shortDisplayName?: string;
-    abbreviation?: string;
   };
 }
 
+// Exported for game processor
 export interface ESPNGameDetailsResponse {
   boxscore?: {
     teams?: ESPNBoxscoreTeam[];
+  };
+  header?: {
+    competitions?: Array<{
+      competitors?: ESPNCompetitor[];
+      status?: {
+        type?: {
+          name?: string;
+        };
+      };
+    }>;
   };
 }
 
 interface ESPNBoxscoreTeam {
   team?: {
     id: string;
+    name?: string;
     displayName?: string;
   };
   statistics?: ESPNStatistic[];

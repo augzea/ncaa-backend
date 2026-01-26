@@ -1,3 +1,5 @@
+console.log("🔥 BACKEND SYNC TEST 🔥");
+
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { config } from 'dotenv';

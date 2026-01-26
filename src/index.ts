@@ -30,15 +30,20 @@ await fastify.register(cors, {
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
 });
 
-// Register main API routes
+// ------------------ ROUTES ------------------
+
+// Register API routes
 await fastify.register(gamesRoutes);
 await fastify.register(teamsRoutes);
 
-// ---------- Health + Version ----------
-fastify.get('/health', async () => {
+// ------------------ SYSTEM ------------------
+
+// Health (API version)
+fastify.get('/api/health', async () => {
   return { ok: true, season: getCurrentSeason() };
 });
 
+// Version proof
 fastify.get('/api/version', async () => {
   return {
     ok: true,
@@ -47,7 +52,7 @@ fastify.get('/api/version', async () => {
   };
 });
 
-// ============ Admin Endpoints ============
+// ------------------ ADMIN ------------------
 
 // Bootstrap status
 fastify.get('/api/admin/bootstrap-status', async () => {
@@ -87,7 +92,7 @@ fastify.post('/api/admin/sync-schedules', async (request: any, reply: any) => {
   }
 });
 
-// Process completed games (stats ingestion)
+// Process completed games
 fastify.get('/api/admin/process-completed-games', async (_request: any, reply: any) => {
   try {
     const results = await processCompletedGames();
@@ -125,47 +130,24 @@ fastify.post('/api/admin/build-averages', async (_request: any, reply: any) => {
   }
 });
 
-// ---------- (Optional) Legacy job endpoints ----------
-fastify.post('/api/admin/jobs/sync-schedules', async (_request: any, reply: any) => {
-  try {
-    const results = await syncSchedules(14);
-    return { ok: true, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Schedule sync failed', details: String(error) });
-  }
+// ------------------ DEBUG ------------------
+
+fastify.ready(() => {
+  console.log('\n=== REGISTERED ROUTES ===');
+  fastify.printRoutes();
 });
 
-fastify.post('/api/admin/jobs/process-games', async (_request: any, reply: any) => {
-  try {
-    const results = await processCompletedGames();
-    return { ok: true, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'Game processing failed', details: String(error) });
-  }
-});
+// ------------------ START ------------------
 
-fastify.post('/api/admin/jobs/build-averages', async (_request: any, reply: any) => {
-  try {
-    const results = await buildNationalAverages();
-    return { ok: true, results };
-  } catch (error) {
-    return reply.status(500).send({ ok: false, error: 'National averages build failed', details: String(error) });
-  }
-});
-
-// Start server
 const port = parseInt(process.env.PORT || '8080', 10);
 const host = process.env.HOST || '0.0.0.0';
 
 try {
-  // Start scheduler (cron jobs)
   setupJobScheduler();
 
-  // Start server
   await fastify.listen({ port, host });
   fastify.log.info(`Server listening at http://${host}:${port}`);
 
-  // Run initial bootstrap (non-blocking)
   runStartupBootstrap();
 } catch (err) {
   fastify.log.error(err);

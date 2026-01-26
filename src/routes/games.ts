@@ -7,30 +7,23 @@ import type { NationalAveragesData } from '../lib/types.js';
 
 const DateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be in format YYYY-MM-DD');
 
-// IMPORTANT:
-// These helpers interpret YYYY-MM-DD as a *local* date (Railway TZ should be America/New_York).
-function startOfLocalDay(dateStr: string): Date {
-  // No "Z" => parsed as local time
-  return new Date(`${dateStr}T00:00:00`);
-}
+// Format a Date into YYYY-MM-DD in America/New_York (ET)
+const fmtET = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'America/New_York',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
 
-function startOfNextLocalDay(dateStr: string): Date {
-  const d = startOfLocalDay(dateStr);
-  d.setDate(d.getDate() + 1);
-  return d;
-}
-
-function startOfLocalDayFromDate(d: Date): Date {
-  const x = new Date(d);
-  x.setHours(0, 0, 0, 0);
-  return x;
+function toLocalDateET(d: Date): string {
+  // en-CA with those options returns YYYY-MM-DD
+  return fmtET.format(d);
 }
 
 export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
   /**
    * GET /api/:league/:season/games
-   * Optional query:
-   *   ?date=YYYY-MM-DD   (interpreted as America/New_York day if TZ is set)
+   * Get games for a specific date (optional query param date=YYYY-MM-DD)
    */
   fastify.get<{
     Params: { league: string; season: string };
@@ -39,6 +32,7 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
     const { league, season } = request.params;
     const { date } = request.query;
 
+    // Validate params
     const leagueResult = LeagueSchema.safeParse(league.toUpperCase());
     if (!leagueResult.success) {
       return reply.status(400).send({ error: 'Invalid league. Must be MENS or WOMENS' });
@@ -49,25 +43,26 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Invalid season format. Must be YYYY-YY' });
     }
 
-    let range: { gte: Date; lt: Date } | undefined;
+    let dateFilter: Date | undefined;
     if (date) {
       const dateResult = DateSchema.safeParse(date);
       if (!dateResult.success) {
         return reply.status(400).send({ error: 'Invalid date format. Must be YYYY-MM-DD' });
       }
-
-      // Local day boundaries (ET if TZ=America/New_York)
-      const gte = startOfLocalDay(date);
-      const lt = startOfNextLocalDay(date);
-      range = { gte, lt };
+      // Interpret date as midnight UTC boundary like before
+      // (your DB stores DateTime in UTC; this filter is a UTC day filter)
+      dateFilter = new Date(date);
     }
 
     const games = await prisma.game.findMany({
       where: {
         league: leagueResult.data,
         season: seasonResult.data,
-        ...(range && {
-          dateTime: range,
+        ...(dateFilter && {
+          dateTime: {
+            gte: dateFilter,
+            lt: new Date(dateFilter.getTime() + 24 * 60 * 60 * 1000),
+          },
         }),
       },
       include: {
@@ -77,31 +72,35 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
       orderBy: { dateTime: 'asc' },
     });
 
-    return games.map(game => ({
-      id: game.id,
-      providerGameId: game.providerGameId,
-      dateTime: game.dateTime.toISOString(),
-      homeTeam: {
-        id: game.homeTeam.id,
-        name: game.homeTeam.name,
-        providerTeamId: game.homeTeam.providerTeamId,
-      },
-      awayTeam: {
-        id: game.awayTeam.id,
-        name: game.awayTeam.name,
-        providerTeamId: game.awayTeam.providerTeamId,
-      },
-      neutralSite: game.neutralSite,
-      status: game.status,
-      homeScore: game.homeScore,
-      awayScore: game.awayScore,
-    }));
+    return games.map(game => {
+      const localDate = toLocalDateET(game.dateTime);
+
+      return {
+        id: game.id,
+        providerGameId: game.providerGameId,
+        dateTime: game.dateTime.toISOString(),
+        localDate, // ✅ NEW: correct ET day label
+        homeTeam: {
+          id: game.homeTeam.id,
+          name: game.homeTeam.name,
+          providerTeamId: game.homeTeam.providerTeamId,
+        },
+        awayTeam: {
+          id: game.awayTeam.id,
+          name: game.awayTeam.name,
+          providerTeamId: game.awayTeam.providerTeamId,
+        },
+        neutralSite: game.neutralSite,
+        status: game.status,
+        homeScore: game.homeScore,
+        awayScore: game.awayScore,
+      };
+    });
   });
 
   /**
    * GET /api/:league/:season/games/week
-   * Optional:
-   *   ?start=YYYY-MM-DD   (interpreted as local date; defaults to "today" local)
+   * Get games for a week starting from a date (optional query param start=YYYY-MM-DD)
    */
   fastify.get<{
     Params: { league: string; season: string };
@@ -120,17 +119,18 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Invalid season format' });
     }
 
-    let startDate: Date;
+    // If provided, validate YYYY-MM-DD
     if (start) {
       const startResult = DateSchema.safeParse(start);
       if (!startResult.success) {
-        return reply.status(400).send({ error: 'Invalid start date format. Must be YYYY-MM-DD' });
+        return reply.status(400).send({ error: 'Invalid start format. Must be YYYY-MM-DD' });
       }
-      startDate = startOfLocalDay(start);
-    } else {
-      // local "today"
-      startDate = startOfLocalDayFromDate(new Date());
     }
+
+    // Keep your original logic: start at midnight local runtime time,
+    // but store/compare as Date objects (UTC-backed).
+    const startDate = start ? new Date(start) : new Date();
+    startDate.setHours(0, 0, 0, 0);
 
     const endDate = new Date(startDate);
     endDate.setDate(endDate.getDate() + 7);
@@ -151,29 +151,35 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
       orderBy: { dateTime: 'asc' },
     });
 
-    return games.map(game => ({
-      id: game.id,
-      providerGameId: game.providerGameId,
-      dateTime: game.dateTime.toISOString(),
-      homeTeam: {
-        id: game.homeTeam.id,
-        name: game.homeTeam.name,
-        providerTeamId: game.homeTeam.providerTeamId,
-      },
-      awayTeam: {
-        id: game.awayTeam.id,
-        name: game.awayTeam.name,
-        providerTeamId: game.awayTeam.providerTeamId,
-      },
-      neutralSite: game.neutralSite,
-      status: game.status,
-      homeScore: game.homeScore,
-      awayScore: game.awayScore,
-    }));
+    return games.map(game => {
+      const localDate = toLocalDateET(game.dateTime);
+
+      return {
+        id: game.id,
+        providerGameId: game.providerGameId,
+        dateTime: game.dateTime.toISOString(),
+        localDate, // ✅ NEW
+        homeTeam: {
+          id: game.homeTeam.id,
+          name: game.homeTeam.name,
+          providerTeamId: game.homeTeam.providerTeamId,
+        },
+        awayTeam: {
+          id: game.awayTeam.id,
+          name: game.awayTeam.name,
+          providerTeamId: game.awayTeam.providerTeamId,
+        },
+        neutralSite: game.neutralSite,
+        status: game.status,
+        homeScore: game.homeScore,
+        awayScore: game.awayScore,
+      };
+    });
   });
 
   /**
    * GET /api/:league/:season/games/:gameId/expected
+   * Get expected total calculation for a game
    */
   fastify.get<{
     Params: { league: string; season: string; gameId: string };
@@ -190,16 +196,24 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'Invalid season format' });
     }
 
+    // Get the game
     const game = await prisma.game.findUnique({
       where: { id: gameId },
       include: {
-        homeTeam: { include: { seasonRollup: true } },
-        awayTeam: { include: { seasonRollup: true } },
+        homeTeam: {
+          include: { seasonRollup: true },
+        },
+        awayTeam: {
+          include: { seasonRollup: true },
+        },
       },
     });
 
-    if (!game) return reply.status(404).send({ error: 'Game not found' });
+    if (!game) {
+      return reply.status(404).send({ error: 'Game not found' });
+    }
 
+    // Get national averages
     const nationals = await prisma.nationalAverages.findUnique({
       where: {
         league_season: {
@@ -213,6 +227,7 @@ export async function gamesRoutes(fastify: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'National averages not available for this league/season' });
     }
 
+    // Convert rollups to per-game stats
     const homeRollup = game.homeTeam.seasonRollup;
     const awayRollup = game.awayTeam.seasonRollup;
 

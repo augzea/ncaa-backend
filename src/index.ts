@@ -6,17 +6,21 @@ import { gamesRoutes } from './routes/games.js';
 import { teamsRoutes } from './routes/teams.js';
 
 import { setupJobScheduler } from './scheduler.js';
-import { syncSchedules, syncSchedulesRange, getCurrentSeason, getDefaultSeasonDateRange } from './jobs/schedule-sync.js';
+import {
+  syncSchedules,
+  syncSchedulesRange,
+  getCurrentSeason,
+  getDefaultSeasonDateRange,
+} from './jobs/schedule-sync.js';
+
 import { processCompletedGames } from './jobs/game-processor.js';
 import { buildNationalAverages } from './jobs/national-averages.js';
-
 import { runStartupBootstrap, getBootstrapStatus } from './bootstrap.js';
 import { prisma } from './lib/prisma.js';
 
-// Load env
 config();
 
-console.log('*** CLEAN BACKEND INDEX ACTIVE: 2026-01-26 ***');
+console.log('*** CLEAN BACKEND INDEX ACTIVE: 2026-01-26 B ***');
 
 const fastify = Fastify({ logger: true });
 
@@ -25,7 +29,7 @@ await fastify.register(cors, {
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
 });
 
-// Main API routes (these define /api/:league/:season/...)
+// Main API routes
 await fastify.register(gamesRoutes);
 await fastify.register(teamsRoutes);
 
@@ -35,7 +39,7 @@ fastify.get('/api/health', async () => ({ ok: true, season: getCurrentSeason() }
 
 fastify.get('/api/version', async () => ({
   ok: true,
-  version: 'CLEAN BACKEND INDEX ACTIVE: 2026-01-26',
+  version: 'CLEAN BACKEND INDEX ACTIVE: 2026-01-26 B',
   season: getCurrentSeason(),
 }));
 
@@ -54,7 +58,6 @@ fastify.get('/api/admin/reset-db', async (request, reply) => {
     });
   }
 
-  // Order matters due to FKs
   const teamGameStatsDeleted = await prisma.teamGameStats.deleteMany({});
   const gamesDeleted = await prisma.game.deleteMany({});
   const rollupsDeleted = await prisma.teamSeasonRollup.deleteMany({});
@@ -94,7 +97,6 @@ fastify.get('/api/admin/sync-schedules', async (request, reply) => {
 });
 
 // -------------------- Admin: FULL SEASON sync (BOTH leagues) --------------------
-// In-memory status so you can check progress without watching logs
 type SeasonSyncStatus = {
   isRunning: boolean;
   startedAt: string | null;
@@ -102,6 +104,7 @@ type SeasonSyncStatus = {
   lastError: string | null;
   lastResult: any | null;
 };
+
 let seasonSyncStatus: SeasonSyncStatus = {
   isRunning: false,
   startedAt: null,
@@ -112,13 +115,6 @@ let seasonSyncStatus: SeasonSyncStatus = {
 
 fastify.get('/api/admin/sync-season-status', async () => seasonSyncStatus);
 
-/**
- * GET /api/admin/sync-season?season=2025-26
- * Optional:
- *   start=YYYY-MM-DD
- *   end=YYYY-MM-DD
- * Runs BOTH leagues by default
- */
 fastify.get('/api/admin/sync-season', async (request, reply) => {
   const q = request.query as any;
   const season = String(q?.season ?? getCurrentSeason());
@@ -135,7 +131,6 @@ fastify.get('/api/admin/sync-season', async (request, reply) => {
     end = def.end;
   }
 
-  // Run in background so the HTTP request doesn’t time out
   if (seasonSyncStatus.isRunning) {
     return reply.status(409).send({
       ok: false,
@@ -154,7 +149,9 @@ fastify.get('/api/admin/sync-season', async (request, reply) => {
 
   setImmediate(async () => {
     try {
-      console.log(`[Admin] sync-season starting for ${season} (${start.toISOString().slice(0,10)} → ${end.toISOString().slice(0,10)})`);
+      console.log(
+        `[Admin] sync-season starting for ${season} (${start.toISOString().slice(0, 10)} → ${end.toISOString().slice(0, 10)})`
+      );
       const res = await syncSchedulesRange({ start, end, season });
       seasonSyncStatus.lastResult = res;
       seasonSyncStatus.finishedAt = new Date().toISOString();
@@ -177,7 +174,7 @@ fastify.get('/api/admin/sync-season', async (request, reply) => {
   };
 });
 
-// -------------------- Admin: Game processing (stats ingestion) --------------------
+// -------------------- Admin: Game processing --------------------
 fastify.get('/api/admin/process-completed-games', async (_request, reply) => {
   try {
     const results = await processCompletedGames();
@@ -194,34 +191,6 @@ fastify.get('/api/admin/build-averages', async (_request, reply) => {
     return { ok: true, season: getCurrentSeason(), results };
   } catch (err) {
     return reply.status(500).send({ ok: false, error: 'build-averages failed', details: String(err) });
-  }
-});
-
-// -------------------- Legacy POST endpoints (optional) --------------------
-fastify.post('/api/admin/jobs/sync-schedules', async (_request, reply) => {
-  try {
-    const results = await syncSchedules(14);
-    return { ok: true, results };
-  } catch (err) {
-    return reply.status(500).send({ ok: false, error: 'legacy sync failed', details: String(err) });
-  }
-});
-
-fastify.post('/api/admin/jobs/process-games', async (_request, reply) => {
-  try {
-    const results = await processCompletedGames();
-    return { ok: true, results };
-  } catch (err) {
-    return reply.status(500).send({ ok: false, error: 'legacy processor failed', details: String(err) });
-  }
-});
-
-fastify.post('/api/admin/jobs/build-averages', async (_request, reply) => {
-  try {
-    const results = await buildNationalAverages();
-    return { ok: true, results };
-  } catch (err) {
-    return reply.status(500).send({ ok: false, error: 'legacy averages failed', details: String(err) });
   }
 });
 

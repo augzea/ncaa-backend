@@ -6,14 +6,14 @@ import { gamesRoutes } from './routes/games.js';
 import { teamsRoutes } from './routes/teams.js';
 
 import { setupJobScheduler } from './scheduler.js';
-import { syncSchedules } from './jobs/schedule-sync.js';
+import { syncSchedules, syncSchedulesRange, getCurrentSeason, getDefaultSeasonDateRange } from './jobs/schedule-sync.js';
 import { processCompletedGames } from './jobs/game-processor.js';
 import { buildNationalAverages } from './jobs/national-averages.js';
 
 import { runStartupBootstrap, getBootstrapStatus } from './bootstrap.js';
 import { prisma } from './lib/prisma.js';
-import { getCurrentSeason } from './jobs/schedule-sync.js';
 
+// Load env
 config();
 
 console.log('*** CLEAN BACKEND INDEX ACTIVE: 2026-01-26 ***');
@@ -25,7 +25,7 @@ await fastify.register(cors, {
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
 });
 
-// Main API routes (define /api/:league/:season/...)
+// Main API routes
 await fastify.register(gamesRoutes);
 await fastify.register(teamsRoutes);
 
@@ -42,7 +42,7 @@ fastify.get('/api/version', async () => ({
 // -------------------- Admin: Bootstrap status --------------------
 fastify.get('/api/admin/bootstrap-status', async () => getBootstrapStatus());
 
-// -------------------- Admin: Reset DB (FIXED FK ORDER) --------------------
+// -------------------- Admin: Reset DB --------------------
 fastify.get('/api/admin/reset-db', async (request, reply) => {
   const confirm = (request.query as any)?.confirm;
 
@@ -54,53 +54,32 @@ fastify.get('/api/admin/reset-db', async (request, reply) => {
     });
   }
 
-  try {
-    const result = await prisma.$transaction(async tx => {
-      // IMPORTANT: delete child tables first, then parents
+  // IMPORTANT: Order matters with foreign keys
+  const teamGameStatsDeleted = await prisma.teamGameStats.deleteMany({});
+  const gamesDeleted = await prisma.game.deleteMany({});
+  const rollupsDeleted = await prisma.teamSeasonRollup.deleteMany({});
+  const nationalsDeleted = await prisma.nationalAverages.deleteMany({});
+  const teamsDeleted = await prisma.team.deleteMany({});
 
-      const teamGameStatsDeleted = await tx.teamGameStats.deleteMany({});
-
-      // If you ever add other tables that reference games/teams, delete them here first.
-
-      const gamesDeleted = await tx.game.deleteMany({});
-
-      const rollupsDeleted = await tx.teamSeasonRollup.deleteMany({});
-
-      const nationalsDeleted = await tx.nationalAverages.deleteMany({});
-
-      const teamsDeleted = await tx.team.deleteMany({});
-
-      return {
-        teamGameStatsDeleted: teamGameStatsDeleted.count,
-        gamesDeleted: gamesDeleted.count,
-        rollupsDeleted: rollupsDeleted.count,
-        nationalsDeleted: nationalsDeleted.count,
-        teamsDeleted: teamsDeleted.count,
-      };
-    });
-
-    return {
-      ok: true,
-      message: 'Database reset complete',
-      result,
-      nextSteps: [
-        '1) /api/admin/sync-season?season=2025-26  (or /api/admin/sync-schedules?days=60)',
-        '2) /api/admin/process-completed-games',
-        '3) /api/admin/build-averages',
-      ],
-    };
-  } catch (err) {
-    fastify.log.error(err);
-    return reply.status(500).send({
-      ok: false,
-      error: 'Database reset failed',
-      details: String(err),
-      tip: 'This is usually a FK constraint order issue. If you added new tables, ensure they are deleted before games/teams.',
-    });
-  }
+  return {
+    ok: true,
+    message: 'Database reset complete',
+    result: {
+      teamGameStatsDeleted: teamGameStatsDeleted.count,
+      gamesDeleted: gamesDeleted.count,
+      rollupsDeleted: rollupsDeleted.count,
+      nationalsDeleted: nationalsDeleted.count,
+      teamsDeleted: teamsDeleted.count,
+    },
+    nextSteps: [
+      '1) /api/admin/sync-season?season=2025-26',
+      '2) /api/admin/process-completed-games',
+      '3) /api/admin/build-averages',
+    ],
+  };
 });
 
-// -------------------- Admin: small window sync --------------------
+// -------------------- Admin: Small-window schedule sync --------------------
 fastify.get('/api/admin/sync-schedules', async (request, reply) => {
   try {
     const days = Number((request.query as any)?.days ?? 14);
@@ -114,7 +93,89 @@ fastify.get('/api/admin/sync-schedules', async (request, reply) => {
   }
 });
 
-// -------------------- Admin: process completed games --------------------
+// -------------------- Admin: FULL SEASON sync (BOTH leagues) --------------------
+type SeasonSyncStatus = {
+  isRunning: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  lastError: string | null;
+  lastResult: any | null;
+};
+
+let seasonSyncStatus: SeasonSyncStatus = {
+  isRunning: false,
+  startedAt: null,
+  finishedAt: null,
+  lastError: null,
+  lastResult: null,
+};
+
+fastify.get('/api/admin/sync-season-status', async () => seasonSyncStatus);
+
+/**
+ * GET /api/admin/sync-season?season=2025-26
+ * Optional:
+ *   start=YYYY-MM-DD
+ *   end=YYYY-MM-DD
+ *
+ * Runs BOTH leagues because syncSchedulesRange runs both leagues.
+ */
+fastify.get('/api/admin/sync-season', async (request, reply) => {
+  const q = request.query as any;
+  const season = String(q?.season ?? getCurrentSeason());
+
+  let start: Date;
+  let end: Date;
+
+  if (q?.start && q?.end) {
+    start = new Date(`${q.start}T00:00:00.000Z`);
+    end = new Date(`${q.end}T00:00:00.000Z`);
+  } else {
+    const def = getDefaultSeasonDateRange(season);
+    start = def.start;
+    end = def.end;
+  }
+
+  if (seasonSyncStatus.isRunning) {
+    return reply.status(409).send({
+      ok: false,
+      error: 'sync-season already running',
+      status: seasonSyncStatus,
+    });
+  }
+
+  seasonSyncStatus = {
+    isRunning: true,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    lastError: null,
+    lastResult: null,
+  };
+
+  // run async so the request doesn't time out
+  setImmediate(async () => {
+    try {
+      const res = await syncSchedulesRange({ start, end, season });
+      seasonSyncStatus.lastResult = res;
+      seasonSyncStatus.finishedAt = new Date().toISOString();
+    } catch (err) {
+      seasonSyncStatus.lastError = String(err);
+      seasonSyncStatus.finishedAt = new Date().toISOString();
+    } finally {
+      seasonSyncStatus.isRunning = false;
+    }
+  });
+
+  return {
+    ok: true,
+    message: 'sync-season started in background',
+    season,
+    range: { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) },
+    statusEndpoint: '/api/admin/sync-season-status',
+  };
+});
+
+// -------------------- Admin: Game processing --------------------
 fastify.get('/api/admin/process-completed-games', async (_request, reply) => {
   try {
     const results = await processCompletedGames();
@@ -124,7 +185,7 @@ fastify.get('/api/admin/process-completed-games', async (_request, reply) => {
   }
 });
 
-// -------------------- Admin: build averages --------------------
+// -------------------- Admin: Build averages --------------------
 fastify.get('/api/admin/build-averages', async (_request, reply) => {
   try {
     const results = await buildNationalAverages();

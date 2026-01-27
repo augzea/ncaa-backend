@@ -10,13 +10,17 @@ const ESPN_MBB_GAME_URL =
 const ESPN_WBB_GAME_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball/summary';
 
-const FETCH_TIMEOUT_MS = 15000; // 15s
+// ESPN often defaults to “featured” / limited slates unless group is specified.
+// For NCAA basketball, Division I is commonly groups=50.
+const NCAA_D1_GROUP = '50';
+
+// Pagination controls (ESPN often honors these)
+const PAGE_LIMIT = 300;
+
+const FETCH_TIMEOUT_MS = 10000; // 10 seconds
 const MAX_RETRIES = 3;
 
-// Small randomized pacing between requests
-const MIN_DELAY_MS = 250;
-const MAX_DELAY_MS = 450;
-
+// Exported types for ESPN data
 export interface ESPNTeamData {
   id: string;
   name: string;
@@ -63,16 +67,33 @@ export interface ESPNBoxscore {
   };
 }
 
+/**
+ * Sleep helper
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Random delay between min and max ms
+ */
 function randomDelay(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+/**
+ * Safely build URL with query params
+ */
+function withParams(baseUrl: string, params: Record<string, string | number | undefined>): string {
+  const url = new URL(baseUrl);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+  }
+  return url.toString();
+}
+
 export class ESPNClient {
-  private lastRequestTime = 0;
+  private lastRequestTime: number = 0;
 
   private getScoreboardUrl(league: League): string {
     return league === 'MENS' ? ESPN_MBB_SCOREBOARD_URL : ESPN_WBB_SCOREBOARD_URL;
@@ -82,17 +103,23 @@ export class ESPNClient {
     return league === 'MENS' ? ESPN_MBB_GAME_URL : ESPN_WBB_GAME_URL;
   }
 
+  /**
+   * Rate limit: ensure minimum delay between requests
+   */
   private async rateLimit(): Promise<void> {
     const now = Date.now();
     const elapsed = now - this.lastRequestTime;
-    const minSpacing = randomDelay(MIN_DELAY_MS, MAX_DELAY_MS);
+    const delay = randomDelay(300, 550);
 
-    if (elapsed < minSpacing) {
-      await sleep(minSpacing - elapsed);
+    if (elapsed < delay) {
+      await sleep(delay - elapsed);
     }
     this.lastRequestTime = Date.now();
   }
 
+  /**
+   * Fetch with timeout, retries, and proper error handling
+   */
   private async fetchWithRetry<T>(url: string, retries: number = MAX_RETRIES): Promise<T> {
     await this.rateLimit();
 
@@ -118,10 +145,10 @@ export class ESPNClient {
         }
 
         return (await response.json()) as T;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
 
-        if ((lastError as any).name === 'AbortError') {
+        if (lastError.name === 'AbortError') {
           lastError = new Error(`ESPN API timeout after ${FETCH_TIMEOUT_MS}ms`);
         }
 
@@ -133,23 +160,66 @@ export class ESPNClient {
       }
     }
 
-    throw lastError ?? new Error('Unknown ESPN fetch error');
+    throw lastError!;
   }
 
+  /**
+   * Get scoreboard for a specific date (ALL Division I games)
+   * Uses groups=50 and paginates using limit/offset when supported.
+   *
+   * @param league - 'MENS' or 'WOMENS'
+   * @param dateYYYYMMDD - Date in YYYYMMDD format
+   */
   async getScoreboard(league: League, dateYYYYMMDD: string): Promise<ESPNEventData[]> {
     const baseUrl = this.getScoreboardUrl(league);
-    const url = `${baseUrl}?dates=${dateYYYYMMDD}`;
 
-    const response = await this.fetchWithRetry<ESPNScoreboardResponse>(url);
-    return this.parseScoreboardEvents(response.events || []);
+    const allEvents: ESPNEvent[] = [];
+    let offset = 0;
+
+    // paginate until ESPN stops returning events
+    while (true) {
+      const url = withParams(baseUrl, {
+        dates: dateYYYYMMDD,
+        groups: NCAA_D1_GROUP,
+        limit: PAGE_LIMIT,
+        offset,
+      });
+
+      const response = await this.fetchWithRetry<ESPNScoreboardResponse>(url);
+      const page = response.events || [];
+
+      if (page.length === 0) break;
+
+      allEvents.push(...page);
+
+      // If ESPN honors limit/offset, page size < limit means we're done.
+      if (page.length < PAGE_LIMIT) break;
+
+      offset += PAGE_LIMIT;
+
+      // safety cap to prevent infinite loops if ESPN ignores offset but always returns same page
+      if (offset > 3000) {
+        console.warn(`[ESPN] Pagination safety cap hit for ${league} ${dateYYYYMMDD}. Returning what we have.`);
+        break;
+      }
+    }
+
+    return this.parseScoreboardEvents(allEvents);
   }
 
+  /**
+   * Get game details/boxscore for a specific event
+   * (we include groups=50 for consistency; ESPN may ignore it here but it doesn’t hurt)
+   */
   async getGameDetails(league: League, eventId: string): Promise<ESPNGameDetailsResponse> {
     const baseUrl = this.getGameUrl(league);
-    const url = `${baseUrl}?event=${eventId}`;
+    const url = withParams(baseUrl, { event: eventId, groups: NCAA_D1_GROUP });
     return this.fetchWithRetry<ESPNGameDetailsResponse>(url);
   }
 
+  /**
+   * Get game summary/boxscore for a completed game (parsed)
+   */
   async getGameSummary(league: League, gameId: string): Promise<ESPNBoxscore | null> {
     try {
       const response = await this.getGameDetails(league, gameId);
@@ -160,14 +230,22 @@ export class ESPNClient {
     }
   }
 
+  /**
+   * Parse scoreboard events into normalized format
+   */
   private parseScoreboardEvents(events: ESPNEvent[]): ESPNEventData[] {
     return events.map(event => {
       const competition = event.competitions?.[0];
-      if (!competition) throw new Error(`No competition found for event ${event.id}`);
+      if (!competition) {
+        throw new Error(`No competition found for event ${event.id}`);
+      }
 
       const homeCompetitor = competition.competitors?.find(c => c.homeAway === 'home');
       const awayCompetitor = competition.competitors?.find(c => c.homeAway === 'away');
-      if (!homeCompetitor || !awayCompetitor) throw new Error(`Missing home/away team for event ${event.id}`);
+
+      if (!homeCompetitor || !awayCompetitor) {
+        throw new Error(`Missing home or away team for event ${event.id}`);
+      }
 
       const parseTeam = (competitor: ESPNCompetitor): ESPNTeamData => {
         const team = competitor.team;
@@ -177,11 +255,10 @@ export class ESPNClient {
           displayName:
             team?.displayName ||
             `${team?.location || ''} ${team?.name || ''}`.trim() ||
-            competitor.name ||
             'Unknown',
           shortDisplayName: team?.shortDisplayName || team?.abbreviation || team?.name || 'UNK',
           abbreviation: team?.abbreviation || competitor.abbreviation || 'UNK',
-          conference: null,
+          conference: null, // you can wire this later if you want
           score: competitor.score ? parseInt(competitor.score, 10) : undefined,
         };
       };
@@ -202,38 +279,48 @@ export class ESPNClient {
     });
   }
 
+  /**
+   * Parse game summary into boxscore format
+   */
   private parseGameSummary(response: ESPNGameDetailsResponse, gameId: string): ESPNBoxscore | null {
     const boxscore = response.boxscore;
-    if (!boxscore?.teams || boxscore.teams.length < 2) return null;
+    if (!boxscore?.teams || boxscore.teams.length < 2) {
+      return null;
+    }
 
+    // Find home and away teams from the header
     const header = response.header;
     const competition = header?.competitions?.[0];
     const homeCompetitor = competition?.competitors?.find(c => c.homeAway === 'home');
     const awayCompetitor = competition?.competitors?.find(c => c.homeAway === 'away');
 
+    // Match boxscore teams to home/away by ID
     const homeTeam = boxscore.teams.find(t => t.team?.id === homeCompetitor?.id);
     const awayTeam = boxscore.teams.find(t => t.team?.id === awayCompetitor?.id);
 
-    // ESPN often lists away first then home; use competitors mapping first, fallback to ordering
-    const resolvedHome = homeTeam || boxscore.teams[1];
-    const resolvedAway = awayTeam || boxscore.teams[0];
+    // Fallback to order (usually away first, home second)
+    const teamHome = homeTeam || boxscore.teams[1];
+    const teamAway = awayTeam || boxscore.teams[0];
 
     return {
       id: gameId,
-      status: competition?.status?.type?.name || 'STATUS_FINAL',
+      status: header?.competitions?.[0]?.status?.type?.name || 'STATUS_FINAL',
       home: {
-        id: resolvedHome?.team?.id || '',
-        name: resolvedHome?.team?.displayName || resolvedHome?.team?.name || 'Unknown',
-        statistics: this.extractTeamStats(resolvedHome?.statistics || []),
+        id: teamHome?.team?.id || '',
+        name: teamHome?.team?.displayName || teamHome?.team?.name || 'Unknown',
+        statistics: this.extractTeamStats(teamHome?.statistics || []),
       },
       away: {
-        id: resolvedAway?.team?.id || '',
-        name: resolvedAway?.team?.displayName || resolvedAway?.team?.name || 'Unknown',
-        statistics: this.extractTeamStats(resolvedAway?.statistics || []),
+        id: teamAway?.team?.id || '',
+        name: teamAway?.team?.displayName || teamAway?.team?.name || 'Unknown',
+        statistics: this.extractTeamStats(teamAway?.statistics || []),
       },
     };
   }
 
+  /**
+   * Extract statistics from ESPN boxscore format
+   */
   private extractTeamStats(statistics: ESPNStatistic[]): ESPNBoxscoreStats | undefined {
     const statMap: Record<string, string> = {};
 
@@ -243,12 +330,9 @@ export class ESPNClient {
       }
     }
 
+    // Parse field goals (format: "30-62" for made-attempted)
     const fgParts = (statMap['fieldGoalsMade-fieldGoalsAttempted'] || statMap['fieldGoals'] || '0-0').split('-');
-    const fg3Parts = (
-      statMap['threePointFieldGoalsMade-threePointFieldGoalsAttempted'] ||
-      statMap['threePointFieldGoals'] ||
-      '0-0'
-    ).split('-');
+    const fg3Parts = (statMap['threePointFieldGoalsMade-threePointFieldGoalsAttempted'] || statMap['threePointFieldGoals'] || '0-0').split('-');
     const ftParts = (statMap['freeThrowsMade-freeThrowsAttempted'] || statMap['freeThrows'] || '0-0').split('-');
 
     const fgm = parseInt(statMap['fieldGoalsMade'] || fgParts[0] || '0', 10);
@@ -259,8 +343,8 @@ export class ESPNClient {
     const fta = parseInt(statMap['freeThrowsAttempted'] || ftParts[1] || '0', 10);
     const points = parseInt(statMap['points'] || statMap['totalPoints'] || '0', 10);
 
-    // If ESPN didn’t provide meaningful shooting totals, skip
-    if (fga === 0 && fta === 0 && fg3a === 0) return undefined;
+    // Only return stats if we have meaningful data
+    if (fga === 0 && fta === 0) return undefined;
 
     return {
       field_goals_made: fgm,
@@ -274,12 +358,15 @@ export class ESPNClient {
   }
 }
 
+// Singleton instance
 let clientInstance: ESPNClient | null = null;
 
 export function getESPNClient(): ESPNClient {
   if (!clientInstance) clientInstance = new ESPNClient();
   return clientInstance;
 }
+
+// ============ Internal ESPN API response types ============
 
 interface ESPNScoreboardResponse {
   events?: ESPNEvent[];
@@ -289,17 +376,24 @@ interface ESPNScoreboardResponse {
 
 interface ESPNEvent {
   id: string;
+  uid?: string;
   date: string;
+  name?: string;
+  shortName?: string;
   competitions?: ESPNCompetition[];
 }
 
 interface ESPNCompetition {
+  id?: string;
+  date?: string;
   neutralSite?: boolean;
   competitors?: ESPNCompetitor[];
   status?: {
     type?: {
+      id?: string;
       name?: string;
       state?: string;
+      description?: string;
       completed?: boolean;
     };
   };
@@ -310,6 +404,7 @@ interface ESPNCompetitor {
   homeAway: 'home' | 'away';
   score?: string;
   name?: string;
+  location?: string;
   abbreviation?: string;
   team?: {
     id: string;
@@ -318,24 +413,20 @@ interface ESPNCompetitor {
     abbreviation?: string;
     displayName?: string;
     shortDisplayName?: string;
+    conferenceId?: string;
   };
 }
 
+// Exported for game processor
 export interface ESPNGameDetailsResponse {
   boxscore?: {
     teams?: ESPNBoxscoreTeam[];
     players?: unknown[];
   };
   header?: {
-    competitions?: ESPNCompetitionHeader[];
+    competitions?: ESPNCompetition[];
   };
-}
-
-interface ESPNCompetitionHeader {
-  competitors?: Array<{ id: string; homeAway: 'home' | 'away' }>;
-  status?: {
-    type?: { name?: string };
-  };
+  gameInfo?: unknown;
 }
 
 interface ESPNBoxscoreTeam {
@@ -350,4 +441,5 @@ interface ESPNBoxscoreTeam {
 interface ESPNStatistic {
   name?: string;
   displayValue?: string;
+  label?: string;
 }

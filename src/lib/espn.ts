@@ -1,21 +1,19 @@
 import type { League } from './types.js';
 
+// ESPN endpoints
 const ESPN_MBB_SCOREBOARD_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard';
 const ESPN_WBB_SCOREBOARD_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball/scoreboard';
-
 const ESPN_MBB_GAME_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/summary';
 const ESPN_WBB_GAME_URL =
   'https://site.api.espn.com/apis/site/v2/sports/basketball/womens-college-basketball/summary';
 
-// ESPN often defaults to “featured” / limited slates unless group is specified.
-// For NCAA basketball, Division I is commonly groups=50.
-const NCAA_D1_GROUP = '50';
-
-// Pagination controls (ESPN often honors these)
-const PAGE_LIMIT = 300;
+// --- Important for "ALL D1 games" ---
+// ESPN scoreboard commonly returns only a subset unless groups + high limit are provided.  [oai_citation:1‡Gist](https://gist.github.com/akeaswaran/b48b02f1c94f873c6655e7129910fc3b?permalink_comment_id=4692879&utm_source=chatgpt.com)
+const ESPN_D1_GROUP = 50;
+const SCOREBOARD_LIMIT = 1000;
 
 const FETCH_TIMEOUT_MS = 10000; // 10 seconds
 const MAX_RETRIES = 3;
@@ -68,7 +66,7 @@ export interface ESPNBoxscore {
 }
 
 /**
- * Sleep helper
+ * Sleep for rate limiting
  */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -79,17 +77,6 @@ function sleep(ms: number): Promise<void> {
  */
 function randomDelay(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-/**
- * Safely build URL with query params
- */
-function withParams(baseUrl: string, params: Record<string, string | number | undefined>): string {
-  const url = new URL(baseUrl);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-  }
-  return url.toString();
 }
 
 export class ESPNClient {
@@ -109,7 +96,7 @@ export class ESPNClient {
   private async rateLimit(): Promise<void> {
     const now = Date.now();
     const elapsed = now - this.lastRequestTime;
-    const delay = randomDelay(300, 550);
+    const delay = randomDelay(300, 500);
 
     if (elapsed < delay) {
       await sleep(delay - elapsed);
@@ -144,7 +131,7 @@ export class ESPNClient {
           );
         }
 
-        return (await response.json()) as T;
+        return response.json() as Promise<T>;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
@@ -160,60 +147,35 @@ export class ESPNClient {
       }
     }
 
-    throw lastError!;
+    throw lastError;
   }
 
   /**
-   * Get scoreboard for a specific date (ALL Division I games)
-   * Uses groups=50 and paginates using limit/offset when supported.
-   *
+   * Get scoreboard for a specific date
+   * IMPORTANT: include groups + limit to get ALL D1 games.  [oai_citation:2‡Gist](https://gist.github.com/akeaswaran/b48b02f1c94f873c6655e7129910fc3b?permalink_comment_id=4692879&utm_source=chatgpt.com)
    * @param league - 'MENS' or 'WOMENS'
    * @param dateYYYYMMDD - Date in YYYYMMDD format
    */
   async getScoreboard(league: League, dateYYYYMMDD: string): Promise<ESPNEventData[]> {
     const baseUrl = this.getScoreboardUrl(league);
 
-    const allEvents: ESPNEvent[] = [];
-    let offset = 0;
+    const url =
+      `${baseUrl}?dates=${encodeURIComponent(dateYYYYMMDD)}` +
+      `&groups=${ESPN_D1_GROUP}` +
+      `&limit=${SCOREBOARD_LIMIT}`;
 
-    // paginate until ESPN stops returning events
-    while (true) {
-      const url = withParams(baseUrl, {
-        dates: dateYYYYMMDD,
-        groups: NCAA_D1_GROUP,
-        limit: PAGE_LIMIT,
-        offset,
-      });
-
-      const response = await this.fetchWithRetry<ESPNScoreboardResponse>(url);
-      const page = response.events || [];
-
-      if (page.length === 0) break;
-
-      allEvents.push(...page);
-
-      // If ESPN honors limit/offset, page size < limit means we're done.
-      if (page.length < PAGE_LIMIT) break;
-
-      offset += PAGE_LIMIT;
-
-      // safety cap to prevent infinite loops if ESPN ignores offset but always returns same page
-      if (offset > 3000) {
-        console.warn(`[ESPN] Pagination safety cap hit for ${league} ${dateYYYYMMDD}. Returning what we have.`);
-        break;
-      }
-    }
-
-    return this.parseScoreboardEvents(allEvents);
+    const response = await this.fetchWithRetry<ESPNScoreboardResponse>(url);
+    return this.parseScoreboardEvents(response.events || []);
   }
 
   /**
    * Get game details/boxscore for a specific event
-   * (we include groups=50 for consistency; ESPN may ignore it here but it doesn’t hurt)
+   * @param league - 'MENS' or 'WOMENS'
+   * @param eventId - ESPN event ID
    */
   async getGameDetails(league: League, eventId: string): Promise<ESPNGameDetailsResponse> {
     const baseUrl = this.getGameUrl(league);
-    const url = withParams(baseUrl, { event: eventId, groups: NCAA_D1_GROUP });
+    const url = `${baseUrl}?event=${encodeURIComponent(eventId)}`;
     return this.fetchWithRetry<ESPNGameDetailsResponse>(url);
   }
 
@@ -249,16 +211,22 @@ export class ESPNClient {
 
       const parseTeam = (competitor: ESPNCompetitor): ESPNTeamData => {
         const team = competitor.team;
+
+        // ESPN sometimes uses placeholder "TBD" competitors in brackets.
+        // We keep the strings as-is so later re-sync can update them when ESPN resolves matchups.
+        const displayName =
+          team?.displayName ||
+          `${team?.location || ''} ${team?.name || ''}`.trim() ||
+          competitor.name ||
+          'TBD';
+
         return {
           id: team?.id || competitor.id,
-          name: team?.name || competitor.name || 'Unknown',
-          displayName:
-            team?.displayName ||
-            `${team?.location || ''} ${team?.name || ''}`.trim() ||
-            'Unknown',
-          shortDisplayName: team?.shortDisplayName || team?.abbreviation || team?.name || 'UNK',
-          abbreviation: team?.abbreviation || competitor.abbreviation || 'UNK',
-          conference: null, // you can wire this later if you want
+          name: team?.name || competitor.name || 'TBD',
+          displayName,
+          shortDisplayName: team?.shortDisplayName || team?.abbreviation || team?.name || competitor.abbreviation || 'TBD',
+          abbreviation: team?.abbreviation || competitor.abbreviation || 'TBD',
+          conference: null,
           score: competitor.score ? parseInt(competitor.score, 10) : undefined,
         };
       };
@@ -288,32 +256,30 @@ export class ESPNClient {
       return null;
     }
 
-    // Find home and away teams from the header
     const header = response.header;
     const competition = header?.competitions?.[0];
     const homeCompetitor = competition?.competitors?.find(c => c.homeAway === 'home');
     const awayCompetitor = competition?.competitors?.find(c => c.homeAway === 'away');
 
-    // Match boxscore teams to home/away by ID
+    // Try to match teams by ID; fallback to ordering
     const homeTeam = boxscore.teams.find(t => t.team?.id === homeCompetitor?.id);
     const awayTeam = boxscore.teams.find(t => t.team?.id === awayCompetitor?.id);
 
-    // Fallback to order (usually away first, home second)
-    const teamHome = homeTeam || boxscore.teams[1];
-    const teamAway = awayTeam || boxscore.teams[0];
+    const team1 = homeTeam || boxscore.teams[1];
+    const team2 = awayTeam || boxscore.teams[0];
 
     return {
       id: gameId,
       status: header?.competitions?.[0]?.status?.type?.name || 'STATUS_FINAL',
       home: {
-        id: teamHome?.team?.id || '',
-        name: teamHome?.team?.displayName || teamHome?.team?.name || 'Unknown',
-        statistics: this.extractTeamStats(teamHome?.statistics || []),
+        id: team1?.team?.id || '',
+        name: team1?.team?.displayName || team1?.team?.name || 'Unknown',
+        statistics: this.extractTeamStats(team1?.statistics || []),
       },
       away: {
-        id: teamAway?.team?.id || '',
-        name: teamAway?.team?.displayName || teamAway?.team?.name || 'Unknown',
-        statistics: this.extractTeamStats(teamAway?.statistics || []),
+        id: team2?.team?.id || '',
+        name: team2?.team?.displayName || team2?.team?.name || 'Unknown',
+        statistics: this.extractTeamStats(team2?.statistics || []),
       },
     };
   }
@@ -330,9 +296,12 @@ export class ESPNClient {
       }
     }
 
-    // Parse field goals (format: "30-62" for made-attempted)
     const fgParts = (statMap['fieldGoalsMade-fieldGoalsAttempted'] || statMap['fieldGoals'] || '0-0').split('-');
-    const fg3Parts = (statMap['threePointFieldGoalsMade-threePointFieldGoalsAttempted'] || statMap['threePointFieldGoals'] || '0-0').split('-');
+    const fg3Parts = (
+      statMap['threePointFieldGoalsMade-threePointFieldGoalsAttempted'] ||
+      statMap['threePointFieldGoals'] ||
+      '0-0'
+    ).split('-');
     const ftParts = (statMap['freeThrowsMade-freeThrowsAttempted'] || statMap['freeThrows'] || '0-0').split('-');
 
     const fgm = parseInt(statMap['fieldGoalsMade'] || fgParts[0] || '0', 10);
@@ -343,8 +312,9 @@ export class ESPNClient {
     const fta = parseInt(statMap['freeThrowsAttempted'] || ftParts[1] || '0', 10);
     const points = parseInt(statMap['points'] || statMap['totalPoints'] || '0', 10);
 
-    // Only return stats if we have meaningful data
-    if (fga === 0 && fta === 0) return undefined;
+    if (fga === 0 && fta === 0) {
+      return undefined;
+    }
 
     return {
       field_goals_made: fgm,
@@ -362,7 +332,9 @@ export class ESPNClient {
 let clientInstance: ESPNClient | null = null;
 
 export function getESPNClient(): ESPNClient {
-  if (!clientInstance) clientInstance = new ESPNClient();
+  if (!clientInstance) {
+    clientInstance = new ESPNClient();
+  }
   return clientInstance;
 }
 
@@ -370,30 +342,21 @@ export function getESPNClient(): ESPNClient {
 
 interface ESPNScoreboardResponse {
   events?: ESPNEvent[];
-  leagues?: unknown[];
-  day?: unknown;
 }
 
 interface ESPNEvent {
   id: string;
-  uid?: string;
   date: string;
-  name?: string;
-  shortName?: string;
   competitions?: ESPNCompetition[];
 }
 
 interface ESPNCompetition {
-  id?: string;
-  date?: string;
   neutralSite?: boolean;
   competitors?: ESPNCompetitor[];
   status?: {
     type?: {
-      id?: string;
       name?: string;
       state?: string;
-      description?: string;
       completed?: boolean;
     };
   };
@@ -404,29 +367,24 @@ interface ESPNCompetitor {
   homeAway: 'home' | 'away';
   score?: string;
   name?: string;
-  location?: string;
   abbreviation?: string;
   team?: {
     id: string;
     name?: string;
-    location?: string;
     abbreviation?: string;
     displayName?: string;
     shortDisplayName?: string;
-    conferenceId?: string;
+    location?: string;
   };
 }
 
-// Exported for game processor
 export interface ESPNGameDetailsResponse {
   boxscore?: {
     teams?: ESPNBoxscoreTeam[];
-    players?: unknown[];
   };
   header?: {
     competitions?: ESPNCompetition[];
   };
-  gameInfo?: unknown;
 }
 
 interface ESPNBoxscoreTeam {
@@ -441,5 +399,4 @@ interface ESPNBoxscoreTeam {
 interface ESPNStatistic {
   name?: string;
   displayValue?: string;
-  label?: string;
 }

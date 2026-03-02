@@ -13,12 +13,26 @@ export interface ProcessCompletedGamesResult {
   errors: string[];
 }
 
+export type ProcessCompletedGamesOptions = {
+  /**
+   * Max number of games to process per run (batch size).
+   * Keep this modest to avoid Railway timeouts.
+   */
+  limit?: number;
+};
+
 /**
  * Job B: Final Game Processor
- * Processes completed games and extracts team shooting stats
+ * Processes FINAL games that are statsProcessed=false and writes TeamGameStats + rollups
+ *
+ * IMPORTANT: This runs in batches to avoid HTTP timeouts on Railway.
  */
-export async function processCompletedGames(): Promise<ProcessCompletedGamesResult> {
-  console.log('[Game Processor] Starting...');
+export async function processCompletedGames(
+  options: ProcessCompletedGamesOptions = {}
+): Promise<ProcessCompletedGamesResult> {
+  const limit = Number.isFinite(options.limit) ? Number(options.limit) : 50;
+
+  console.log(`[Game Processor] Starting batch... (limit=${limit})`);
   const client = getESPNClient();
 
   const result: ProcessCompletedGamesResult = {
@@ -28,7 +42,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
     errors: [],
   };
 
-  // Find games that are FINAL but not yet processed
+  // Find FINAL games not yet processed (batch)
   const unprocessedGames = await prisma.game.findMany({
     where: {
       status: 'FINAL',
@@ -39,37 +53,30 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
       awayTeam: true,
     },
     orderBy: { dateTime: 'asc' },
+    take: limit,
   });
 
   result.gamesFound = unprocessedGames.length;
-  console.log(`[Game Processor] Found ${unprocessedGames.length} unprocessed final games`);
+  console.log(`[Game Processor] Found ${unprocessedGames.length} unprocessed final games (this batch)`);
 
   for (const game of unprocessedGames) {
     try {
-      console.log(`[Game Processor] Processing ${game.providerGameId}: ${game.awayTeam.name} @ ${game.homeTeam.name}`);
+      console.log(
+        `[Game Processor] Processing providerGameId=${game.providerGameId}: ${game.awayTeam.name} @ ${game.homeTeam.name}`
+      );
 
-      // Fetch game details from ESPN (parsed boxscore)
       const boxscore = await client.getGameSummary(game.league as PrismaLeague, game.providerGameId);
 
-      if (!boxscore) {
-        console.log(`[Game Processor] No boxscore returned for ${game.providerGameId}, skipping`);
+      if (!boxscore || !boxscore.home.statistics || !boxscore.away.statistics) {
+        console.log(`[Game Processor] No statistics available for ${game.providerGameId}, skipping`);
+        // Mark as processed? NO — keep false so we can retry later if ESPN was temporarily missing data.
         result.gamesSkipped++;
         continue;
       }
 
-      // ESPN sometimes fails to attach statistics for one/both teams
       const homeStats = boxscore.home.statistics;
       const awayStats = boxscore.away.statistics;
 
-      if (!homeStats || !awayStats) {
-        console.log(
-          `[Game Processor] Missing stats for ${game.providerGameId}. homeStats=${!!homeStats} awayStats=${!!awayStats}. Skipping.`
-        );
-        result.gamesSkipped++;
-        continue;
-      }
-
-      // Compute 2PT from FG and 3PT: 2PTM = FGM - 3PTM, 2PTA = FGA - 3PTA
       const home2pt = derive2ptFromFg(
         homeStats.field_goals_made,
         homeStats.field_goals_att,
@@ -84,7 +91,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
         awayStats.three_points_att
       );
 
-      // Upsert team game stats for HOME team
+      // Upsert stats: HOME
       await prisma.teamGameStats.upsert({
         where: {
           gameId_teamId: {
@@ -99,7 +106,6 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           league: game.league,
           season: game.season,
 
-          // Home team offensive stats
           off2ptm: home2pt.twoPtm,
           off2pta: home2pt.twoPta,
           off3ptm: homeStats.three_points_made,
@@ -107,7 +113,6 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           offFtm: homeStats.free_throws_made,
           offFta: homeStats.free_throws_att,
 
-          // Home team defensive stats (what opponent scored)
           def2ptmAllowed: away2pt.twoPtm,
           def2ptaAllowed: away2pt.twoPta,
           def3ptmAllowed: awayStats.three_points_made,
@@ -122,6 +127,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           off3pta: homeStats.three_points_att,
           offFtm: homeStats.free_throws_made,
           offFta: homeStats.free_throws_att,
+
           def2ptmAllowed: away2pt.twoPtm,
           def2ptaAllowed: away2pt.twoPta,
           def3ptmAllowed: awayStats.three_points_made,
@@ -131,7 +137,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
         },
       });
 
-      // Upsert team game stats for AWAY team
+      // Upsert stats: AWAY
       await prisma.teamGameStats.upsert({
         where: {
           gameId_teamId: {
@@ -146,7 +152,6 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           league: game.league,
           season: game.season,
 
-          // Away team offensive stats
           off2ptm: away2pt.twoPtm,
           off2pta: away2pt.twoPta,
           off3ptm: awayStats.three_points_made,
@@ -154,7 +159,6 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           offFtm: awayStats.free_throws_made,
           offFta: awayStats.free_throws_att,
 
-          // Away team defensive stats (what home scored)
           def2ptmAllowed: home2pt.twoPtm,
           def2ptaAllowed: home2pt.twoPta,
           def3ptmAllowed: homeStats.three_points_made,
@@ -169,6 +173,7 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
           off3pta: awayStats.three_points_att,
           offFtm: awayStats.free_throws_made,
           offFta: awayStats.free_throws_att,
+
           def2ptmAllowed: home2pt.twoPtm,
           def2ptaAllowed: home2pt.twoPta,
           def3ptmAllowed: homeStats.three_points_made,
@@ -178,11 +183,11 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
         },
       });
 
-      // Update season rollups for both teams (aggregate update)
+      // Update rollups for both teams
       await updateTeamSeasonRollup(game.homeTeamId, game.league as PrismaLeague, game.season);
       await updateTeamSeasonRollup(game.awayTeamId, game.league as PrismaLeague, game.season);
 
-      // Mark game as processed + ensure scores are stored
+      // Mark processed
       await prisma.game.update({
         where: { id: game.id },
         data: {
@@ -193,27 +198,29 @@ export async function processCompletedGames(): Promise<ProcessCompletedGamesResu
       });
 
       result.gamesProcessed++;
-      console.log(`[Game Processor] Successfully processed ${game.providerGameId}`);
+      console.log(`[Game Processor] ✅ Processed ${game.providerGameId}`);
     } catch (error) {
       const errMsg = `Game ${game.providerGameId}: ${String(error)}`;
       result.errors.push(errMsg);
-      console.error(`[Game Processor] Error: ${errMsg}`);
+      console.error(`[Game Processor] ❌ ${errMsg}`);
     }
   }
 
   console.log(
-    `[Game Processor] Complete. Processed: ${result.gamesProcessed}, Skipped: ${result.gamesSkipped}, Errors: ${result.errors.length}`
+    `[Game Processor] Batch complete. Found=${result.gamesFound} Processed=${result.gamesProcessed} Skipped=${result.gamesSkipped} Errors=${result.errors.length}`
   );
+
   return result;
 }
 
 /**
  * Update a team's season rollup by aggregating all their game stats
+ * NOTE: Your schema has TeamSeasonRollup unique by teamId ONLY.
  */
 async function updateTeamSeasonRollup(teamId: string, league: PrismaLeague, season: string): Promise<void> {
   const stats = await prisma.teamGameStats.aggregate({
     where: { teamId, league, season },
-    _count: { _all: true },
+    _count: true,
     _sum: {
       off2ptm: true,
       off2pta: true,
@@ -230,15 +237,13 @@ async function updateTeamSeasonRollup(teamId: string, league: PrismaLeague, seas
     },
   });
 
-  const gamesPlayed = stats._count._all;
-
   await prisma.teamSeasonRollup.upsert({
     where: { teamId },
     create: {
       teamId,
       league,
       season,
-      gamesPlayed,
+      gamesPlayed: stats._count,
       off2ptmTotal: stats._sum.off2ptm ?? 0,
       off2ptaTotal: stats._sum.off2pta ?? 0,
       off3ptmTotal: stats._sum.off3ptm ?? 0,
@@ -253,7 +258,9 @@ async function updateTeamSeasonRollup(teamId: string, league: PrismaLeague, seas
       defFtaAllowedTotal: stats._sum.defFtaAllowed ?? 0,
     },
     update: {
-      gamesPlayed,
+      league,
+      season,
+      gamesPlayed: stats._count,
       off2ptmTotal: stats._sum.off2ptm ?? 0,
       off2ptaTotal: stats._sum.off2pta ?? 0,
       off3ptmTotal: stats._sum.off3ptm ?? 0,

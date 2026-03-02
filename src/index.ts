@@ -73,7 +73,7 @@ fastify.get('/api/admin/reset-db', async (request, reply) => {
     },
     nextSteps: [
       '1) /api/admin/sync-season?season=2025-26',
-      '2) /api/admin/process-completed-games',
+      '2) /api/admin/process-completed-games-start?limit=50  (watch status)',
       '3) /api/admin/build-averages',
     ],
   };
@@ -112,14 +112,6 @@ let seasonSyncStatus: SeasonSyncStatus = {
 
 fastify.get('/api/admin/sync-season-status', async () => seasonSyncStatus);
 
-/**
- * GET /api/admin/sync-season?season=2025-26
- * Optional:
- *   start=YYYY-MM-DD
- *   end=YYYY-MM-DD
- *
- * Runs BOTH leagues because syncSchedulesRange runs both leagues.
- */
 fastify.get('/api/admin/sync-season', async (request, reply) => {
   const q = request.query as any;
   const season = String(q?.season ?? getCurrentSeason());
@@ -152,7 +144,6 @@ fastify.get('/api/admin/sync-season', async (request, reply) => {
     lastResult: null,
   };
 
-  // run async so the request doesn't time out
   setImmediate(async () => {
     try {
       const res = await syncSchedulesRange({ start, end, season });
@@ -175,14 +166,100 @@ fastify.get('/api/admin/sync-season', async (request, reply) => {
   };
 });
 
-// -------------------- Admin: Game processing --------------------
-fastify.get('/api/admin/process-completed-games', async (_request, reply) => {
+// -------------------- Admin: Game processing (BATCH + BACKGROUND) --------------------
+type ProcessorStatus = {
+  isRunning: boolean;
+  startedAt: string | null;
+  finishedAt: string | null;
+  lastError: string | null;
+  totalProcessed: number;
+  totalSkipped: number;
+  lastBatch: any | null;
+};
+
+let processorStatus: ProcessorStatus = {
+  isRunning: false,
+  startedAt: null,
+  finishedAt: null,
+  lastError: null,
+  totalProcessed: 0,
+  totalSkipped: 0,
+  lastBatch: null,
+};
+
+fastify.get('/api/admin/process-completed-games-status', async () => processorStatus);
+
+/**
+ * Runs ONE batch and returns quickly (no timeout).
+ * Example: /api/admin/process-completed-games?limit=50
+ */
+fastify.get('/api/admin/process-completed-games', async (request, reply) => {
   try {
-    const results = await processCompletedGames();
+    const limit = Number((request.query as any)?.limit ?? 50);
+    if (!Number.isFinite(limit) || limit < 1 || limit > 200) {
+      return reply.status(400).send({ ok: false, error: 'limit must be 1..200' });
+    }
+
+    const results = await processCompletedGames({ limit });
     return { ok: true, results };
   } catch (err) {
     return reply.status(500).send({ ok: false, error: 'process-completed-games failed', details: String(err) });
   }
+});
+
+/**
+ * Starts continuous processing in the background until gamesFound=0.
+ * Example: /api/admin/process-completed-games-start?limit=50
+ */
+fastify.get('/api/admin/process-completed-games-start', async (request, reply) => {
+  const limit = Number((request.query as any)?.limit ?? 50);
+  if (!Number.isFinite(limit) || limit < 1 || limit > 200) {
+    return reply.status(400).send({ ok: false, error: 'limit must be 1..200' });
+  }
+
+  if (processorStatus.isRunning) {
+    return reply.status(409).send({ ok: false, error: 'processor already running', status: processorStatus });
+  }
+
+  processorStatus = {
+    isRunning: true,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    lastError: null,
+    totalProcessed: 0,
+    totalSkipped: 0,
+    lastBatch: null,
+  };
+
+  setImmediate(async () => {
+    try {
+      // Keep running batches until nothing left
+      // Small pause between batches to be nice to ESPN + Railway
+      while (true) {
+        const batch = await processCompletedGames({ limit });
+        processorStatus.lastBatch = batch;
+        processorStatus.totalProcessed += batch.gamesProcessed;
+        processorStatus.totalSkipped += batch.gamesSkipped;
+
+        if (batch.gamesFound === 0) break;
+        await new Promise(r => setTimeout(r, 250));
+      }
+
+      processorStatus.finishedAt = new Date().toISOString();
+    } catch (err) {
+      processorStatus.lastError = String(err);
+      processorStatus.finishedAt = new Date().toISOString();
+    } finally {
+      processorStatus.isRunning = false;
+    }
+  });
+
+  return {
+    ok: true,
+    message: 'processor started in background',
+    limit,
+    statusEndpoint: '/api/admin/process-completed-games-status',
+  };
 });
 
 // -------------------- Admin: Build averages --------------------

@@ -11,7 +11,6 @@ export interface LeagueSyncResult {
   teamsUpdated: number;
   gamesInserted: number;
   gamesUpdated: number;
-  gamesDeleted: number; // NEW: pruned stale games
   errors: string[];
 }
 
@@ -46,9 +45,12 @@ export function getCurrentSeason(): string {
   const month = now.getUTCMonth() + 1;
 
   // NCAA season typically spans Nov-Apr
-  if (month >= 10) return `${year}-${String(year + 1).slice(2)}`;
-  if (month <= 4) return `${year - 1}-${String(year).slice(2)}`;
-
+  if (month >= 10) {
+    return `${year}-${String(year + 1).slice(2)}`;
+  }
+  if (month <= 4) {
+    return `${year - 1}-${String(year).slice(2)}`;
+  }
   // Off-season: default to upcoming season
   return `${year}-${String(year + 1).slice(2)}`;
 }
@@ -68,16 +70,21 @@ export function getDefaultSeasonDateRange(season: string): { start: Date; end: D
   const endYear = startYear + 1;
 
   const start = new Date(Date.UTC(startYear, 10, 1)); // Nov 1
-  const end = new Date(Date.UTC(endYear, 3, 15)); // Apr 15
+  const end = new Date(Date.UTC(endYear, 3, 15));     // Apr 15
   return { start, end };
 }
 
 /**
  * Map ESPN game status to our status enum
+ * IMPORTANT: handle POSTPONED/CANCELLED before "completed"
  */
 function mapGameStatus(event: ESPNEventData): GameStatus {
-  if (event.completed) return 'FINAL';
+  const statusName = (event.statusName || '').toUpperCase();
 
+  if (statusName.includes('POSTPON')) return 'POSTPONED';
+  if (statusName.includes('CANCEL')) return 'CANCELLED';
+
+  // ESPN state hints
   switch (event.statusState) {
     case 'post':
       return 'FINAL';
@@ -85,56 +92,12 @@ function mapGameStatus(event: ESPNEventData): GameStatus {
       return 'IN_PROGRESS';
     case 'pre':
       return 'SCHEDULED';
-    default: {
-      const statusName = (event.statusName || '').toUpperCase();
-      if (statusName.includes('POSTPONED')) return 'POSTPONED';
-      if (statusName.includes('CANCEL')) return 'CANCELLED';
-      return 'SCHEDULED';
-    }
   }
-}
 
-/**
- * Utility: start/end UTC bounds for a given UTC date
- */
-function dayBoundsUTC(date: Date): { start: Date; end: Date } {
-  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0, 0));
-  const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1, 0, 0, 0, 0));
-  return { start, end };
-}
+  // Fallback: completed flag
+  if (event.completed) return 'FINAL';
 
-/**
- * Prune stale games for a given league/season/day.
- * This fixes "TBD vs TBD" sticking around when ESPN later publishes
- * the real matchup (often with a different event id).
- *
- * Rule: after fetching ESPN's scoreboard for the day, the DB should contain
- * only games whose providerGameId is in the fetched list for that same day.
- */
-async function pruneStaleGamesForDay(args: {
-  league: PrismaLeague;
-  season: string;
-  day: Date; // any time within the day (UTC)
-  keepProviderGameIds: Set<string>;
-}): Promise<number> {
-  const { league, season, day, keepProviderGameIds } = args;
-  const { start, end } = dayBoundsUTC(day);
-
-  // If ESPN returned nothing, do NOT delete everything for that day.
-  // This protects you from a transient ESPN outage/empty response.
-  if (keepProviderGameIds.size === 0) return 0;
-
-  const deleted = await prisma.game.deleteMany({
-    where: {
-      league,
-      season,
-      dateTime: { gte: start, lt: end },
-      // delete games not in ESPN's returned list
-      providerGameId: { notIn: Array.from(keepProviderGameIds) },
-    },
-  });
-
-  return deleted.count;
+  return 'SCHEDULED';
 }
 
 /**
@@ -170,8 +133,8 @@ export async function syncSchedulesRange(args: {
     startDate: start.toISOString().split('T')[0],
     endDate: end.toISOString().split('T')[0],
     days,
-    mens: { teamsInserted: 0, teamsUpdated: 0, gamesInserted: 0, gamesUpdated: 0, gamesDeleted: 0, errors: [] },
-    womens: { teamsInserted: 0, teamsUpdated: 0, gamesInserted: 0, gamesUpdated: 0, gamesDeleted: 0, errors: [] },
+    mens: { teamsInserted: 0, teamsUpdated: 0, gamesInserted: 0, gamesUpdated: 0, errors: [] },
+    womens: { teamsInserted: 0, teamsUpdated: 0, gamesInserted: 0, gamesUpdated: 0, errors: [] },
     totalErrors: [],
   };
 
@@ -182,25 +145,20 @@ export async function syncSchedulesRange(args: {
 
   for (const { key: league, prismaLeague, resultKey } of leagues) {
     for (let i = 0; i < days; i++) {
-      const day = new Date(start.getTime() + i * msPerDay);
-      const dateStr = formatDateYYYYMMDD(day);
+      const date = new Date(start.getTime() + i * msPerDay);
+      const dateStr = formatDateYYYYMMDD(date);
 
       try {
         const events = await client.getScoreboard(league, dateStr);
 
-        // Track providerGameIds returned by ESPN for this day (for pruning)
-        const keepIds = new Set<string>();
-
         for (const event of events) {
-          keepIds.add(event.id);
-
           try {
-            // Upsert teams
+            // Upsert teams (including placeholder "TBD" teams if ESPN provides them)
             const homeTeamResult = await upsertTeam(
               prismaLeague,
               season,
               event.home.id,
-              event.home.displayName
+              event.home.displayName,
             );
             result[resultKey].teamsInserted += homeTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += homeTeamResult.inserted ? 0 : 1;
@@ -209,7 +167,7 @@ export async function syncSchedulesRange(args: {
               prismaLeague,
               season,
               event.away.id,
-              event.away.displayName
+              event.away.displayName,
             );
             result[resultKey].teamsInserted += awayTeamResult.inserted ? 1 : 0;
             result[resultKey].teamsUpdated += awayTeamResult.inserted ? 0 : 1;
@@ -229,15 +187,6 @@ export async function syncSchedulesRange(args: {
             result[resultKey].errors.push(errMsg);
           }
         }
-
-        // NEW: prune stale games for this league/day after a successful fetch
-        const prunedCount = await pruneStaleGamesForDay({
-          league: prismaLeague,
-          season,
-          day,
-          keepProviderGameIds: keepIds,
-        });
-        result[resultKey].gamesDeleted += prunedCount;
       } catch (dateError) {
         const errMsg = `${league} ${dateStr}: ${String(dateError)}`;
         result[resultKey].errors.push(errMsg);
@@ -251,13 +200,13 @@ export async function syncSchedulesRange(args: {
 
 /**
  * Upsert a team and ensure it has a season rollup record
- * NOTE: your Prisma schema does NOT have shortName and TeamSeasonRollup is unique by teamId only.
+ * NOTE: TeamSeasonRollup is unique by teamId only in your schema.
  */
 async function upsertTeam(
   league: PrismaLeague,
   season: string,
   providerTeamId: string,
-  name: string
+  name: string,
 ): Promise<{ team: { id: string }; inserted: boolean }> {
   const existing = await prisma.team.findUnique({
     where: {
@@ -288,7 +237,6 @@ async function upsertTeam(
     },
   });
 
-  // Rollup is unique by teamId in YOUR schema
   await prisma.teamSeasonRollup.upsert({
     where: { teamId: team.id },
     create: { teamId: team.id, league, season },
@@ -300,6 +248,7 @@ async function upsertTeam(
 
 /**
  * Upsert a game
+ * IMPORTANT FIX: update homeTeamId/awayTeamId so TBD games can become real matchups later.
  */
 async function upsertGame(
   league: PrismaLeague,
@@ -341,9 +290,12 @@ async function upsertGame(
     },
     update: {
       dateTime: new Date(event.date),
+
+      // ✅ THESE are what fixes "TBD vs TBD" not updating:
       homeTeamId,
       awayTeamId,
       neutralSite: event.neutralSite,
+
       status: mapGameStatus(event),
       homeScore: event.home.score ?? null,
       awayScore: event.away.score ?? null,

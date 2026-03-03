@@ -67,12 +67,20 @@ export async function processCompletedGames(
 
       const boxscore = await client.getGameSummary(game.league as PrismaLeague, game.providerGameId);
 
-      if (!boxscore || !boxscore.home.statistics || !boxscore.away.statistics) {
-        console.log(`[Game Processor] No statistics available for ${game.providerGameId}, skipping`);
-        // Mark as processed? NO — keep false so we can retry later if ESPN was temporarily missing data.
-        result.gamesSkipped++;
-        continue;
-      }
+if (!boxscore || !boxscore.home.statistics || !boxscore.away.statistics) {
+  console.log(`[Game Processor] No statistics available for ${game.providerGameId}, marking processed and skipping`);
+
+  await prisma.game.update({
+    where: { id: game.id },
+    data: {
+      statsProcessed: true, // IMPORTANT: prevents re-processing loop
+      lastSyncedAt: new Date(),
+    },
+  });
+
+  result.gamesSkipped++;
+  continue;
+}
 
       const homeStats = boxscore.home.statistics;
       const awayStats = boxscore.away.statistics;

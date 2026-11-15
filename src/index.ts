@@ -52,6 +52,63 @@ fastify.get('/support', async (_request, reply) => {
   `);
 });
 
+fastify.get('/privacy', async (_request, reply) => {
+  return reply.type('text/html; charset=utf-8').send(`
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Privacy Policy</title>
+      </head>
+      <body style="font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; line-height: 1.6;">
+        <h1>Privacy Policy</h1>
+        <p>NCAA Basketball Totals Betting</p>
+        <p>Last updated: November 15, 2026</p>
+
+        <h2>Bets and preferences</h2>
+        <p>Logged bets and preferences are stored locally on your
+        device. The app does not provide accounts or cross-device
+        synchronization and does not upload your bet history to
+        our backend. Device backups may include local app data,
+        depending on your operating-system settings.</p>
+
+        <h2>Sports data requests</h2>
+        <p>The app connects to our backend, hosted on Railway, to
+        retrieve schedules, statistics, and calculations. Requests
+        include the relevant league, season, dates, game or team
+        identifiers, and any team-search text you enter. Our backend
+        obtains sports information from ESPN.</p>
+
+        <h2>Technical information</h2>
+        <p>Network services receive connection information such as
+        IP addresses when handling requests. Hosting services and
+        error logs may retain technical information for operation,
+        security, and troubleshooting. Automatic application
+        request logging is disabled.</p>
+
+        <h2>Advertising and analytics</h2>
+        <p>We do not use advertising or cross-app tracking.
+        Optional Expo Insights telemetry and Vibecode production
+        diagnostic injection have been removed from this release.</p>
+
+        <h2>Support</h2>
+        <p>If you email us, we receive your email address and the
+        information you provide, which we use to respond.</p>
+
+        <h2>Managing your data</h2>
+        <p>You can delete individual bets within the app.
+        Removing the app removes its local storage, subject to
+        operating-system backup and restoration behavior.</p>
+
+        <h2>Contact</h2>
+        <p>For privacy questions, email
+        <a href="mailto:augzea10@aol.com">augzea10@aol.com</a>.</p>
+      </body>
+    </html>
+  `);
+});
+
 // -------------------- Health + Version --------------------
 fastify.get('/health', async () => ({ ok: true, season: getCurrentSeason() }));
 fastify.get('/api/health', async () => ({ ok: true, season: getCurrentSeason() }));

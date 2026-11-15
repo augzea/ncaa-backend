@@ -29,6 +29,26 @@ await fastify.register(cors, {
 await fastify.register(gamesRoutes);
 await fastify.register(teamsRoutes);
 
+fastify.get('/support', async (_request, reply) => {
+  return reply.type('text/html; charset=utf-8').send(`
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>App Support</title>
+      </head>
+      <body style="font-family: sans-serif; max-width: 600px; margin: 60px auto; padding: 20px;">
+        <h1>NCAA Basketball Totals Betting</h1>
+        <h2>Support</h2>
+        <p>For questions or help with the app, email
+          <a href="mailto:augzea10@aol.com">augzea10@aol.com</a>.
+        </p>
+      </body>
+    </html>
+  `);
+});
+
 // -------------------- Health + Version --------------------
 fastify.get('/health', async () => ({ ok: true, season: getCurrentSeason() }));
 fastify.get('/api/health', async () => ({ ok: true, season: getCurrentSeason() }));

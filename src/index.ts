@@ -18,7 +18,10 @@ config();
 
 console.log('*** CLEAN BACKEND INDEX ACTIVE: 2026-01-26 ***');
 
-const fastify = Fastify({ logger: true });
+const fastify = Fastify({
+  logger: true,
+  disableRequestLogging: true,
+});
 
 await fastify.register(cors, {
   origin: true,

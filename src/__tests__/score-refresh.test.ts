@@ -94,3 +94,36 @@ describe('scoreboard refresh', () => {
           expect(data).not.toHaveProperty('awayScore');
         }
       }
+      expect(calls[3].update).toMatchObject({ status: 'FINAL', homeScore: null, awayScore: null });
+      expect(calls[5].update).toMatchObject({ status: 'IN_PROGRESS', homeScore: 0, awayScore: 2 });
+    }
+  });
+});
+
+describe('final game processing', () => {
+  it('processes shooting statistics without overwriting scoreboard points when the summary omits points', async () => {
+    const statistics = [
+      { name: 'fieldGoalsMade-fieldGoalsAttempted', displayValue: '27-60' },
+      { name: 'threePointFieldGoalsMade-threePointFieldGoalsAttempted', displayValue: '7-22' },
+      { name: 'freeThrowsMade-freeThrowsAttempted', displayValue: '15-20' },
+    ];
+    vi.spyOn(getESPNClient(), 'getGameDetails').mockResolvedValue({
+      header: { competitions: [{ status: { type: status }, competitors: [summaryHome, summaryAway] }] },
+      boxscore: { teams: [{ team: { id: '2' }, statistics }, { team: { id: '1' }, statistics }] },
+    });
+    vi.mocked(prisma.game.findMany).mockResolvedValue([{
+      id: 'game', league: 'WOMENS', season: '2026-27', providerGameId: 'espn',
+      homeScore: 76, awayScore: 81, homeTeamId: 'a', awayTeamId: 'b',
+      homeTeam: { name: 'Home' }, awayTeam: { name: 'Away' },
+    }] as never);
+
+    const result = await processCompletedGames();
+
+    expect(result.gamesProcessed).toBe(1);
+    expect(prisma.teamGameStats.upsert).toHaveBeenCalledTimes(2);
+    expect(prisma.game.update).toHaveBeenCalledTimes(1);
+    expect(prisma.game.update).toHaveBeenCalledWith({
+      where: { id: 'game' }, data: { statsProcessed: true },
+    });
+  });
+});

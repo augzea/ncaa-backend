@@ -47,7 +47,6 @@ export interface ESPNBoxscoreStats {
   three_points_att: number;
   free_throws_made: number;
   free_throws_att: number;
-  points: number;
 }
 
 export interface ESPNBoxscore {
@@ -77,6 +76,13 @@ function sleep(ms: number): Promise<void> {
  */
 function randomDelay(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function parseScore(raw: unknown): number | undefined {
+  if (typeof raw === 'string' && /^\d+$/.test(raw.trim())) raw = Number(raw);
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 0 && raw <= 2_147_483_647
+    ? raw
+    : undefined;
 }
 
 export class ESPNClient {
@@ -227,7 +233,7 @@ export class ESPNClient {
           shortDisplayName: team?.shortDisplayName || team?.abbreviation || team?.name || competitor.abbreviation || 'TBD',
           abbreviation: team?.abbreviation || competitor.abbreviation || 'TBD',
           conference: null,
-          score: competitor.score ? parseInt(competitor.score, 10) : undefined,
+          score: parseScore(competitor.score),
         };
       };
 
@@ -310,7 +316,6 @@ export class ESPNClient {
     const fg3a = parseInt(statMap['threePointFieldGoalsAttempted'] || fg3Parts[1] || '0', 10);
     const ftm = parseInt(statMap['freeThrowsMade'] || ftParts[0] || '0', 10);
     const fta = parseInt(statMap['freeThrowsAttempted'] || ftParts[1] || '0', 10);
-    const points = parseInt(statMap['points'] || statMap['totalPoints'] || '0', 10);
 
     if (fga === 0 && fta === 0) {
       return undefined;
@@ -323,7 +328,6 @@ export class ESPNClient {
       three_points_att: fg3a,
       free_throws_made: ftm,
       free_throws_att: fta,
-      points,
     };
   }
 }

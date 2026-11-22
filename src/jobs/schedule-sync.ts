@@ -100,13 +100,26 @@ function mapGameStatus(event: ESPNEventData): GameStatus {
   return 'SCHEDULED';
 }
 
+const RECENT_SCOREBOARD_DAYS = 3;
+const scoreboardDateFormat = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+});
+
 /**
- * Sync schedules for the next N days (both leagues)
+ * Refresh recent results and the next N days (including today) for both leagues.
+ * ESPN scoreboard dates are Eastern calendar dates, not UTC game timestamps.
  */
 export async function syncSchedules(days: number = 14): Promise<SyncSchedulesResult> {
-  const today = new Date();
-  const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
-  const end = new Date(start);
+  const parts = scoreboardDateFormat.formatToParts(new Date());
+  const part = (type: 'year' | 'month' | 'day') => Number(parts.find(p => p.type === type)?.value);
+  // Use UTC as a date-only counter so ET daylight saving changes don't shift days.
+  const today = new Date(Date.UTC(part('year'), part('month') - 1, part('day')));
+  const start = new Date(today);
+  start.setUTCDate(start.getUTCDate() - RECENT_SCOREBOARD_DAYS);
+  const end = new Date(today);
   end.setUTCDate(end.getUTCDate() + (days - 1));
 
   const season = getCurrentSeason();
@@ -267,6 +280,21 @@ async function upsertGame(
     },
   });
 
+  const status = mapGameStatus(event);
+  const { score: homeScore } = event.home;
+  const { score: awayScore } = event.away;
+  // Treat partial scores and the empty 0-0 placeholder as unavailable. Never mix
+  // one side of a new snapshot with a score from a previous snapshot.
+  const scores = (status === 'IN_PROGRESS' || status === 'FINAL') &&
+    homeScore !== undefined && awayScore !== undefined && (homeScore > 0 || awayScore > 0)
+    ? { homeScore, awayScore }
+    : undefined;
+  // Do not promote a stale in-progress score to a final result. An incomplete
+  // follow-up snapshot may only retain scores that were already marked final.
+  const scoreUpdate = scores ?? (status === 'FINAL' && existing?.status !== 'FINAL'
+    ? { homeScore: null, awayScore: null }
+    : undefined);
+
   await prisma.game.upsert({
     where: {
       league_season_providerGameId: {
@@ -283,9 +311,8 @@ async function upsertGame(
       homeTeamId,
       awayTeamId,
       neutralSite: event.neutralSite,
-      status: mapGameStatus(event),
-      homeScore: event.home.score ?? null,
-      awayScore: event.away.score ?? null,
+      status,
+      ...scores,
       lastSyncedAt: new Date(),
     },
     update: {
@@ -296,9 +323,8 @@ async function upsertGame(
       awayTeamId,
       neutralSite: event.neutralSite,
 
-      status: mapGameStatus(event),
-      homeScore: event.home.score ?? null,
-      awayScore: event.away.score ?? null,
+      status,
+      ...scoreUpdate,
       lastSyncedAt: new Date(),
     },
   });

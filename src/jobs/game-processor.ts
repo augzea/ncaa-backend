@@ -195,14 +195,10 @@ if (!boxscore || !boxscore.home.statistics || !boxscore.away.statistics) {
       await updateTeamSeasonRollup(game.homeTeamId, game.league as PrismaLeague, game.season);
       await updateTeamSeasonRollup(game.awayTeamId, game.league as PrismaLeague, game.season);
 
-      // Mark processed
+      // Scoreboard sync owns the score. Team box-score stats commonly omit points.
       await prisma.game.update({
         where: { id: game.id },
-        data: {
-          statsProcessed: true,
-          homeScore: homeStats.points ?? game.homeScore,
-          awayScore: awayStats.points ?? game.awayScore,
-        },
+        data: { statsProcessed: true },
       });
 
       result.gamesProcessed++;
